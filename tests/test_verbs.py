@@ -7,7 +7,6 @@ are registered (401 not 404 without auth) and testing input validation logic.
 
 from __future__ import annotations
 
-import pytest
 from fastapi.testclient import TestClient
 
 from app.main import app

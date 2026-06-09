@@ -19,8 +19,10 @@ from fastapi import APIRouter, Query, Request
 from fastapi.responses import JSONResponse
 
 from app.auth import Auth
-from app.database import db_exec, db_one, db_query
+from app.database import db_exec, db_one, db_query, db_tx_core
 from app.errors import json_error
+from app.helpers.attributes import attach_attributes
+from app.helpers.documents import document_neighbors
 
 router = APIRouter()
 
@@ -86,9 +88,7 @@ def _load_subject_detail(auth: Auth, subject_id: int) -> dict | None:
     )
     subject["related_subjects"] = _map_related(rels, subject_id)
 
-    # TODO: Documents linked through the unified graph (document_neighbors).
-    # Document helpers are not built yet (Task 19) — return empty list for now.
-    subject["documents"] = []
+    subject["documents"] = db_tx_core(auth.conn, lambda c: document_neighbors(c, subject_id))
 
     return subject
 
@@ -185,7 +185,8 @@ def list_subjects(
         r["linked_verbs"] = int(r["linked_verbs"])
         r["related_subjects"] = int(r["related_subjects"])
 
-    # ?with=attributes is accepted but not yet implemented (Task 19).
+    if with_ == "attributes":
+        attach_attributes(auth.conn, rows, "maludb_subject_with_attributes", "subject_id")
 
     return {"subjects": rows}
 

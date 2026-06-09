@@ -16,7 +16,7 @@ from typing import Any
 
 import psycopg
 
-from app.database import db_one, db_query
+from app.database import db_one
 from app.errors import json_error
 
 # ---------------------------------------------------------------------------

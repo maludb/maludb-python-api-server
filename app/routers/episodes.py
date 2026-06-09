@@ -24,6 +24,7 @@ from fastapi.responses import JSONResponse
 from app.auth import Auth
 from app.database import db_exec, db_one, db_query, db_tx_core
 from app.errors import json_error
+from app.helpers.attributes import attach_attributes
 from app.helpers.statements import STATEMENT_COLS, shape_statement, svpor_create_statement
 
 router = APIRouter()
@@ -95,7 +96,8 @@ def list_episodes(
         for r in rows:
             shape_episode(r)
 
-        # ?with=attributes is accepted but not yet implemented (Task 20).
+        if with_ == "attributes":
+            attach_attributes(conn, rows, "maludb_episode_with_attributes", "episode_id")
 
         return rows
 

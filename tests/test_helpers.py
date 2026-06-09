@@ -6,15 +6,12 @@ Pure unit tests using mock data; no database connection required.
 
 from __future__ import annotations
 
-import json
-from copy import deepcopy
 from decimal import Decimal
 
 import pytest
 
-from app.helpers.statements import STATEMENT_COLS, shape_statement
 from app.helpers.attributes import ATTRIBUTE_COLS, shape_attribute
-
+from app.helpers.statements import STATEMENT_COLS, shape_statement
 
 # ---------------------------------------------------------------------------
 # shape_statement

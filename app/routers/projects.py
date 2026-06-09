@@ -23,6 +23,7 @@ from fastapi.responses import JSONResponse
 from app.auth import Auth
 from app.database import db_exec, db_one, db_query, db_tx_core
 from app.errors import json_error
+from app.helpers.documents import document_neighbors
 
 router = APIRouter()
 
@@ -77,9 +78,7 @@ def _load_project_detail(auth: Auth, project_id: int) -> dict | None:
     project["subjects"] = subjects
     project["verbs"] = verbs
 
-    # Documents linked through the unified graph — document helpers not built yet;
-    # return empty list for now.
-    project["documents"] = []
+    project["documents"] = db_tx_core(auth.conn, lambda c: document_neighbors(c, project_id))
 
     return project
 
