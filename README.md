@@ -13,14 +13,13 @@ sudo apt update
 sudo apt install -y git curl python3-venv python3-pip postgresql postgresql-contrib
 ```
 
-- `git`, `curl` — clone the repo and run the health check.
-- `python3-venv`, `python3-pip` — Ubuntu 24.04 marks the system Python as *externally managed* (PEP 668), so project dependencies must be installed inside a virtual environment, not system-wide.
-- `postgresql`, `postgresql-contrib` — the tenant data store (Ubuntu 24.04 ships PostgreSQL 16). `psycopg` installs prebuilt binary wheels, so no `libpq-dev` or compiler is required.
-
 ### 2. Create the tenant PostgreSQL database
 
 The API is multi-tenant: every token maps to a PostgreSQL database that holds the actual knowledge graph. Create a login role and a database for your tenant. Maludb-core should be installed with a database, user account, and schema already created.  If it is not, you can create a new database named 'maludu', with a user and schema both named 'app' with the instructions below.
 
+DO NOT
+DO NOT - DO NOT UPGRADE POSTGRES TO VERSION 18
+DO NOT
 ```bash
 sudo -u postgres createdb maludb
 sudo -u postgres psql -d maludb -c "CREATE EXTENSION maludb_core CASCADE"
@@ -70,7 +69,7 @@ Once maludb_core is installed in your tenant database, continue to [Authenticati
 ## Requirements
 
 - Python 3.12+
-- PostgreSQL 14+ (with maludb_core 0.96.0 installed)
+- PostgreSQL 17 (with maludb_core 0.96.0 installed)
 - No other services required (SQLite replaces MySQL for auth)
 
 ## Configuration
