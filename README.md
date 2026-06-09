@@ -1,21 +1,71 @@
 # maludb-python-simple
 
-A Python FastAPI rewrite of [maludb-lamp-api-server](https://github.com/maludb/maludb-lamp-api-server.git) — the JSON API server for [MaluDB](https://maludb.com), a knowledge graph database.
-
-This project serves as both a **working API server** (targeting maludb_core 0.96.0) and a **learning-friendly codebase** — every route handler contains its SQL inline, making the path from URL to query visible in one file.
+This serves as both a **working API server** (targeting maludb_core 0.96.0) and a **learning-friendly codebase** — every route handler contains its SQL inline, making the path from URL to query visible in one file.
 
 ## Quick Start
 
+These steps take a **fresh Ubuntu 24.04 LTS** machine — nothing installed beyond the base OS — to a running API server. Ubuntu 24.04 already ships Python 3.12, which is the only interpreter version this project needs.
+
+### 1. Install system packages
+
 ```bash
-# Install
-pip install -e ".[dev]"
-
-# Run the dev server
-uvicorn app.main:app --reload --port 8000
-
-# Health check
-curl http://localhost:8000/health
+sudo apt update
+sudo apt install -y git curl python3-venv python3-pip postgresql postgresql-contrib
 ```
+
+- `git`, `curl` — clone the repo and run the health check.
+- `python3-venv`, `python3-pip` — Ubuntu 24.04 marks the system Python as *externally managed* (PEP 668), so project dependencies must be installed inside a virtual environment, not system-wide.
+- `postgresql`, `postgresql-contrib` — the tenant data store (Ubuntu 24.04 ships PostgreSQL 16). `psycopg` installs prebuilt binary wheels, so no `libpq-dev` or compiler is required.
+
+### 2. Create the tenant PostgreSQL database
+
+The API is multi-tenant: every token maps to a PostgreSQL database that holds the actual knowledge graph. Create a login role and a database for your tenant. Maludb-core should be installed with a database, user account, and schema already created.  If it is not, you can create a new database named 'maludu', with a user and schema both named 'app' with the instructions below.
+
+```bash
+sudo -u postgres createdb maludb
+sudo -u postgres psql -d maludb -c "CREATE EXTENSION maludb_core CASCADE"
+sudo -u postgres psql -d maludb -tAc "SELECT maludb_core.maludb_core_version()"
+sudo -u postgres psql -d maludb -c "CREATE USER app"
+sudo -u postgres psql -d maludb -c "CREATE SCHEMA app AUTHORIZATION app"
+sudo -u postgres psql -d maludb -c "SELECT * FROM maludb_core.enable_memory_schema('app')"
+sudo -u postgres psql -d maludb -c "SET ROLE app; SET search_path TO app, maludb_core, public; SELECT * FROM maludb_subject"
+sudo -u postgres psql -c "ALTER USER app PASSWORD '#change_on_install#'"
+```
+
+> **maludb_core is a prerequisite, not part of this repo.** The data endpoints (and minting a token) require the **maludb_core 0.96.0** facade views and functions to already exist in the tenant database. Install them into the `maludb` database above by following the [MaluDB](https://maludb.com) project instructions before continuing past the health check. The server itself — and `/health` — starts without it.
+
+### 3. Clone and install the API server
+
+```bash
+git clone https://github.com/maludb/maludb-python-api-server.git
+cd maludb-python-api-server
+
+# Create and activate a virtual environment (required on Ubuntu 24.04)
+python3 -m venv .venv
+source .venv/bin/activate
+
+# Install the project with its dev dependencies
+pip install -e ".[dev]"
+```
+
+> **`pip install` reports `Command 'pip' not found`?** You're not in the virtual environment. Ubuntu has no system-wide `pip` command — `apt install python3-pip` only provides `pip3`, never bare `pip`. The `pip` command exists *only* after `source .venv/bin/activate`, which also changes your shell prompt to start with `(.venv)`. Verify with `which pip` — it should point inside `.venv/bin/`.
+
+### 4. Run the dev server
+
+```bash
+uvicorn app.main:app --reload --port 8000
+```
+
+The SQLite auth store (`data/auth.db`) is created and migrated automatically on first use — there is no manual database bootstrap step.
+
+### 5. Verify
+
+```bash
+curl http://localhost:8000/health
+# {"status":"ok"}
+```
+
+Once maludb_core is installed in your tenant database, continue to [Authentication](#authentication) to mint your first token.
 
 ## Requirements
 
