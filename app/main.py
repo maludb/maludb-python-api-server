@@ -18,7 +18,7 @@ from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoin
 from app import config
 from app.database import TenantDatabaseError
 from app.errors import APIError, api_error_handler, database_error_handler, tenant_db_error_handler
-from app.routers import episodes, notes, pools, projects, skills, statements, subjects, tokens, types, verbs
+from app.routers import attributes, episodes, notes, pools, projects, skills, statements, subjects, tokens, types, verbs
 from app.sql_log import SqlTracer, set_tracer
 
 # ---------------------------------------------------------------------------
@@ -31,6 +31,7 @@ app = FastAPI(title="MaluDB API")
 # Routers
 # ---------------------------------------------------------------------------
 
+app.include_router(attributes.router)
 app.include_router(episodes.router)
 app.include_router(notes.router)
 app.include_router(pools.router)
