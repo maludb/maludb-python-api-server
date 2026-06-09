@@ -22,6 +22,7 @@ from app.routers import (
     attributes,
     documents,
     episodes,
+    graph,
     notes,
     objects,
     pools,
@@ -48,6 +49,7 @@ app = FastAPI(title="MaluDB API")
 app.include_router(attributes.router)
 app.include_router(documents.router)
 app.include_router(episodes.router)
+app.include_router(graph.router)
 app.include_router(notes.router)
 app.include_router(objects.router)
 app.include_router(pools.router)
