@@ -80,6 +80,13 @@ class TenantConnection:
                 autocommit=True,
                 connect_timeout=5,
             )
+            # The per-tenant facade views (maludb_subject, maludb_verb, …) live in
+            # the tenant's own schema, which is named after the connecting role.
+            # The cluster/database default search_path does not include "$user", so
+            # without this those relations don't resolve (→ UndefinedTable → 500).
+            # SET LOCAL in db_tx_core() still layers maludb_core on top per-transaction.
+            with conn.cursor() as cur:
+                cur.execute('SET search_path TO "$user", maludb_core, public')
             return conn
         except psycopg.OperationalError as exc:
             msg = str(exc)
@@ -125,21 +132,23 @@ def db_one(conn: psycopg.Connection, sql: str, params: list | tuple = ()) -> dic
 
 
 def db_tx_core(conn: psycopg.Connection, fn: Callable[[psycopg.Connection], Any]) -> Any:
-    """Run *fn* inside a transaction with ``SET LOCAL search_path TO public, maludb_core``.
+    """Run *fn* inside a transaction with the core facades on the search_path.
 
-    Mirrors PHP's db_tx_core(): the maludb_core facade views and functions
-    reference their base tables unqualified, so they only resolve when
-    maludb_core is on the search_path.  ``SET LOCAL`` keeps the change scoped
-    to the transaction.
+    The per-tenant facade views and functions (maludb_memory_model_config,
+    maludb_upload_document, …) live in the tenant's own schema, which is named
+    after the connecting role — so ``"$user"`` must lead the search_path or the
+    unqualified facade calls fail with UndefinedFunction/UndefinedTable. The
+    maludb_core schema follows so those facades resolve their own base objects.
 
-    The callback receives the connection; db_query / db_one / db_exec can use
-    the same connection inside the callback.  On any exception we roll back
-    and re-raise (the global handler maps DB SQLSTATEs to 409/422/500).
+    ``SET LOCAL`` keeps the change scoped to the transaction.  The callback
+    receives the connection; db_query / db_one / db_exec can use the same
+    connection inside it.  On any exception we roll back and re-raise (the
+    global handler maps DB SQLSTATEs to 409/422/500).
     """
     # psycopg v3: use conn.transaction() context manager
     with conn.transaction():
         with conn.cursor() as cur:
-            cur.execute("SET LOCAL search_path TO public, maludb_core")
+            cur.execute('SET LOCAL search_path TO "$user", maludb_core, public')
         return fn(conn)
 
 
