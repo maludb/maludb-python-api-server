@@ -23,6 +23,8 @@ from app.routers import (
     documents,
     episodes,
     graph,
+    memory,
+    model_prompts,
     notes,
     objects,
     pools,
@@ -50,6 +52,8 @@ app.include_router(attributes.router)
 app.include_router(documents.router)
 app.include_router(episodes.router)
 app.include_router(graph.router)
+app.include_router(memory.router)
+app.include_router(model_prompts.router)
 app.include_router(notes.router)
 app.include_router(objects.router)
 app.include_router(pools.router)
