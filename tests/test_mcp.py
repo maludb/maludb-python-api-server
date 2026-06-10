@@ -234,6 +234,12 @@ class TestToolsCallValidation:
         assert body["error"]["code"] == -32602
         assert "skill_id" in body["error"]["message"]
 
+    def test_non_numeric_limit_is_invalid_params(self, client: TestClient):
+        resp = call_tool(client, "find_subjects", {"limit": "lots"})
+        body = resp.json()
+        assert body["error"]["code"] == -32602
+        assert '"limit"' in body["error"]["message"]
+
 
 # ---------------------------------------------------------------------------
 # tools/call — handlers (db helpers / cores patched)

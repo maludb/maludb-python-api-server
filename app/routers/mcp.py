@@ -280,6 +280,15 @@ def _error_result(code: str, message: str, sqlstate: str | None = None) -> dict:
     }
 
 
+def _int_arg(args: dict, name: str, default: int) -> int:
+    """Coerce an optional integer argument; a non-numeric value -> -32602."""
+    value = args.get(name, default)
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        raise _InvalidParams(f'"{name}" must be an integer.') from None
+
+
 # ---------------------------------------------------------------------------
 # Transport-level checks
 # ---------------------------------------------------------------------------
@@ -342,7 +351,7 @@ def _tool_search_memory(auth, args: dict) -> dict:
         raise _InvalidParams('"query" must be a non-empty string.')
     subject = str(args["subject"]).strip() if args.get("subject") and str(args["subject"]).strip() else None
     verb = str(args["verb"]).strip() if args.get("verb") and str(args["verb"]).strip() else None
-    limit = max(1, min(50, int(args.get("limit", 10))))
+    limit = max(1, min(50, _int_arg(args, "limit", 10)))
     namespace = str(args.get("namespace") or "default").strip() or "default"
 
     if subject is None and verb is None:
@@ -381,7 +390,7 @@ def _tool_search_memory(auth, args: dict) -> dict:
 
 def _tool_find_subjects(auth, args: dict) -> dict:
     q = str(args["query"]).strip() if args.get("query") and str(args["query"]).strip() else None
-    limit = max(1, min(200, int(args.get("limit", 25))))
+    limit = max(1, min(200, _int_arg(args, "limit", 25)))
 
     where = ""
     params: list = []
@@ -444,7 +453,7 @@ def _tool_explore_subject(auth, args: dict) -> dict:
     direction = str(args.get("direction") or "both").strip().lower()
     if direction not in ("out", "in", "both"):
         raise _InvalidParams('"direction" must be one of: out, in, both.')
-    depth = max(1, min(3, int(args.get("depth", 1))))
+    depth = max(1, min(3, _int_arg(args, "depth", 1)))
     verb = str(args["verb"]).strip() if args.get("verb") and str(args["verb"]).strip() else None
     rel_list = [verb] if verb else None
 
@@ -577,7 +586,7 @@ def _tool_find_skills(auth, args: dict) -> dict:
     q = str(args["query"]).strip() if args.get("query") and str(args["query"]).strip() else None
     subject = str(args["subject"]).strip() if args.get("subject") and str(args["subject"]).strip() else None
     verb = str(args["verb"]).strip() if args.get("verb") and str(args["verb"]).strip() else None
-    limit = max(1, min(200, int(args.get("limit", 20))))
+    limit = max(1, min(200, _int_arg(args, "limit", 20)))
 
     if subject or verb:
         rows = db_query(
