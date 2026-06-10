@@ -8,6 +8,7 @@ PHP's $GLOBALS).
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from contextvars import ContextVar
@@ -15,6 +16,19 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from app import config
+
+
+def _json_safe_param(p):  # noqa: ANN001, ANN202
+    """A loggable stand-in for one query parameter.
+
+    bytea params (document bytes, skill bundle files) are summarized — dumping
+    raw bytes into json.dumps raises TypeError and megabyte blobs don't belong
+    in sql.log or ?debug=1 responses anyway.
+    """
+    if isinstance(p, (bytes, bytearray, memoryview)):
+        b = bytes(p)
+        return f"<{len(b)} bytes sha256:{hashlib.sha256(b).hexdigest()[:12]}>"
+    return p
 
 # ---------------------------------------------------------------------------
 # SqlTracer — collects queries for one request
@@ -36,13 +50,14 @@ class SqlTracer:
 
     def log(self, sql: str, params: list | tuple, rows: int, dur_ms: float) -> None:
         """Record a query in the in-memory trace and append to the log file."""
+        safe_params = [_json_safe_param(p) for p in params]
         self.queries.append({
             "sql": sql.strip(),
-            "params": list(params),
+            "params": safe_params,
             "rows": rows,
             "dur_ms": round(dur_ms, 1),
         })
-        _write_log_line(self, sql, params, rows, dur_ms)
+        _write_log_line(self, sql, safe_params, rows, dur_ms)
 
 
 # ---------------------------------------------------------------------------
@@ -85,7 +100,7 @@ def _write_log_line(tracer: SqlTracer, sql: str, params: list | tuple, rows: int
     line = (
         f"{_iso_now_ms()}  {tracer.endpoint}  {tracer.method}  {tracer.uri}  user={tracer.user_id}\n"
         f"  SQL: {formatted_sql}\n"
-        f"  PARAMS: {json.dumps(list(params))}\n"
+        f"  PARAMS: {json.dumps([_json_safe_param(p) for p in params], default=str)}\n"
         f"  ROWS: {rows}\n"
         f"  DUR:  {dur_ms:.1f} ms\n\n"
     )

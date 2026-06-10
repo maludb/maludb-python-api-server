@@ -27,6 +27,8 @@ _AUTH_PATHS = [
     ("PATCH", "/v1/skills/1"),
     ("DELETE", "/v1/skills/1"),
     ("POST", "/v1/skills/1/duplicate"),
+    ("POST", "/v1/skills/ingest"),
+    ("GET", "/v1/skills/1/bundle"),
 ]
 
 
