@@ -1,5 +1,6 @@
 """
-Skill endpoints — list, create, detail, update, delete, duplicate (fork).
+Skill endpoints — list, create, detail, update, delete, duplicate (fork),
+agent-skill ingest (0.97.0), and bundle download.
 
 Ports PHP's skills.php, skills_id.php, skills_id_duplicate.php.
 
@@ -9,18 +10,46 @@ Live-schema mapping (DB column -> API field):
 Source table: maludb_skill (skill_id from sequence).
 Defaults: version '1.0.0', visibility 'private', packaging_kind 'system_prompt', enabled true.
 DB enforces visibility/packaging_kind value sets (-> 422).
+
+Agent skills (maludb_core 0.97.0): POST /v1/skills/ingest registers a Claude
+Agent Skill bundle (SKILL.md + scripts/references/assets) as an immutable
+skill version — discovery tags extracted via the configured LLM (or a
+deterministic frontmatter-only fallback), divergent fork lineage, and
+supersession when a revision is not materially different from its parent.
+Registered agent skills (bundle_hash set) are content-immutable: PATCH
+rejects content fields with 409; lifecycle fields stay editable.
 """
 
 from __future__ import annotations
 
+import base64
+import binascii
+import json
+
 from fastapi import APIRouter, Query, Request
 from fastapi.responses import JSONResponse
 
-from app.auth import Auth
+from app.auth import Auth, get_auth_store
 from app.database import db_exec, db_one, db_query, db_tx_core
 from app.errors import json_error
+from app.helpers.llm import llm_complete, llm_json_from_text
+from app.helpers.skills import (
+    bundle_hash,
+    coerce_skill_extraction,
+    deterministic_discovery,
+    file_sha256,
+    materiality_screens,
+)
 
 router = APIRouter()
+
+# Bundle size caps (the Anthropic API caps skill uploads at 30 MB zipped;
+# we cap the unpacked JSON payload in the same spirit).
+_MAX_FILE_BYTES = 5 * 1024 * 1024
+_MAX_BUNDLE_BYTES = 30 * 1024 * 1024
+
+# Content columns rejected on PATCH once a skill carries a bundle_hash.
+_IMMUTABLE_FIELDS = ("name", "markdown", "version", "packaging_kind")
 
 
 # ---------------------------------------------------------------------------
@@ -55,8 +84,31 @@ def list_skills(
     auth: Auth,
     visibility: str | None = Query(default=None, max_length=40),
     q: str | None = Query(default=None, max_length=200),
+    subject: str | None = Query(default=None, max_length=200),
+    verb: str | None = Query(default=None, max_length=200),
     limit: int = Query(default=50, le=200),
 ):
+    # Tag-aware discovery: subject/verb hit the skill_subject/skill_verb tag
+    # tables (and q the keyword/tsquery rails) through maludb_skill_search,
+    # which also folds in visible public skills, scoring, and lineage.
+    # The plain list (no subject/verb) keeps the original ILIKE semantics.
+    if subject or verb:
+        rows = db_query(
+            auth.conn,
+            """SELECT owner_schema, skill_id AS id, skill_name AS name, description,
+                      version, visibility, subjects, verbs, keywords, score,
+                      match_reasons, is_public, is_forkable,
+                      source_owner_schema, source_skill_id, updated_at
+                 FROM maludb_skill_search(%s, %s, %s, NULL, %s)""",
+            [q, subject, verb, limit],
+        )
+        for r in rows:
+            r["id"] = int(r["id"])
+            r["score"] = None if r["score"] is None else float(r["score"])
+            if r["source_skill_id"] is not None:
+                r["source_skill_id"] = int(r["source_skill_id"])
+        return {"skills": rows}
+
     clauses: list[str] = []
     params: list = []
     if visibility:
@@ -146,10 +198,30 @@ def get_skill(skill_id: int, auth: Auth):
 
 @router.patch("/v1/skills/{skill_id}")
 async def update_skill(skill_id: int, auth: Auth, request: Request):
-    if db_one(auth.conn, "SELECT 1 FROM maludb_skill WHERE skill_id = %s", [skill_id]) is None:
+    row = db_one(
+        auth.conn,
+        "SELECT bundle_hash FROM maludb_skill WHERE skill_id = %s",
+        [skill_id],
+    )
+    if row is None:
         json_error("not_found", "Skill not found.", 404)
 
     body = await request.json()
+
+    # Registered agent skills are content-immutable (a DB trigger enforces
+    # this too); a changed bundle must be re-ingested as a new skill version.
+    if row.get("bundle_hash"):
+        blocked = [f for f in _IMMUTABLE_FIELDS if f in body]
+        if blocked:
+            json_error(
+                "skill_content_immutable",
+                "Fields "
+                + ", ".join(blocked)
+                + " are immutable on a registered agent skill; re-upload the changed bundle"
+                " via POST /v1/skills/ingest (it becomes a new version with fork lineage)."
+                " Editable here: description, visibility, enabled.",
+                409,
+            )
     fields: list[str] = []
     params: list = []
 
@@ -248,3 +320,469 @@ async def duplicate_skill(skill_id: int, auth: Auth, request: Request):
     skill["enabled"] = None if skill["enabled"] is None else bool(skill["enabled"])
 
     return JSONResponse(status_code=201, content={"skill": skill})
+
+
+# ===========================================================================
+# POST /v1/skills/ingest — register a Claude Agent Skill bundle (0.97.0)
+# ===========================================================================
+
+
+def _decode_files(body: dict, name: str, markdown: str) -> list[dict]:
+    """Decode the request's files[] into {relative_path, content(bytes), ...}.
+
+    Accepts content_base64 (binary-safe) or content_text per file.  SKILL.md
+    is synthesized from the markdown when the client didn't include it, so
+    the manifest always describes the complete, reconstructable bundle.
+    """
+    raw = body.get("files") or []
+    if not isinstance(raw, list):
+        json_error("validation_failed", 'Field "files" must be an array.', 422)
+
+    files: list[dict] = []
+    total = 0
+    seen_paths: set[str] = set()
+    for i, f in enumerate(raw):
+        if not isinstance(f, dict):
+            json_error("validation_failed", f"files[{i}] must be an object.", 422)
+        rel = str(f.get("relative_path") or "").strip()
+        if not rel or rel.startswith("/") or ".." in rel.split("/"):
+            json_error("validation_failed", f"files[{i}].relative_path is missing or unsafe.", 422)
+        if rel in seen_paths:
+            json_error("validation_failed", f"files[{i}]: duplicate relative_path {rel!r}.", 422)
+        seen_paths.add(rel)
+
+        if f.get("content_base64") is not None:
+            try:
+                content = base64.b64decode(str(f["content_base64"]), validate=True)
+            except (binascii.Error, ValueError):
+                json_error("validation_failed", f"files[{i}].content_base64 is not valid base64.", 422)
+        elif f.get("content_text") is not None:
+            content = str(f["content_text"]).encode("utf-8")
+        else:
+            json_error("validation_failed", f"files[{i}] needs content_base64 or content_text.", 422)
+
+        if len(content) > _MAX_FILE_BYTES:
+            json_error("payload_too_large", f"files[{i}] ({rel}) exceeds {_MAX_FILE_BYTES} bytes.", 413)
+        total += len(content)
+        if total > _MAX_BUNDLE_BYTES:
+            json_error("payload_too_large", f"Bundle exceeds {_MAX_BUNDLE_BYTES} bytes.", 413)
+
+        files.append(
+            {
+                "relative_path": rel,
+                "content": content,
+                "file_hash": file_sha256(content),
+                "file_size": len(content),
+                "is_executable": bool(f.get("is_executable")),
+                "media_type": (str(f["media_type"]).strip() or None) if f.get("media_type") else None,
+            }
+        )
+
+    if "SKILL.md" not in seen_paths:
+        content = markdown.encode("utf-8")
+        files.insert(
+            0,
+            {
+                "relative_path": "SKILL.md",
+                "content": content,
+                "file_hash": file_sha256(content),
+                "file_size": len(content),
+                "is_executable": False,
+                "media_type": "text/markdown",
+            },
+        )
+    return files
+
+
+def _render_type_catalog(auth: Auth) -> tuple[str, str]:
+    """Entity-type and event-kind bullet lists from the live catalog (0.96.0)."""
+    try:
+        type_rows = db_query(
+            auth.conn,
+            "SELECT category, subject_type, description FROM maludb_subject_type ORDER BY category, sort_order",
+        )
+    except Exception:
+        type_rows = db_query(
+            auth.conn,
+            "SELECT category, subject_type, description"
+            " FROM maludb_core.malu$svpor_subject_type ORDER BY category, sort_order",
+        )
+    entity_lines: list[str] = []
+    event_lines: list[str] = []
+    for r in type_rows:
+        desc = " — " + r["description"] if r.get("description") and str(r["description"]).strip() else ""
+        line = f"  - {r['subject_type']}{desc}"
+        (event_lines if (r.get("category") or "entity") == "event" else entity_lines).append(line)
+    return (
+        "\n".join(entity_lines) if entity_lines else "  - other",
+        "\n".join(event_lines) if event_lines else "  - task",
+    )
+
+
+def _judge_materiality(pr: dict, parent_markdown: str, new_markdown: str, name: str) -> bool:
+    """LLM judge for the gray zone: SKILL.md body changed, nothing else did.
+
+    Returns True (materially different -> coexist) unless the model clearly
+    answers otherwise; a judge failure must never hide a version wrongly.
+    """
+    system = (
+        "You compare two versions of an AI agent skill (its SKILL.md instructions) and decide"
+        " whether the revision MATERIALLY changes what the skill does: different capabilities,"
+        " different behavior, different instructions an agent would follow. Typo fixes, rewording"
+        " with identical meaning, and formatting changes are NOT material."
+        ' Respond with exactly one JSON object: {"materially_different": true|false}.'
+    )
+    user = f"SKILL: {name}\n\n=== PARENT VERSION ===\n{parent_markdown}\n\n=== NEW VERSION ===\n{new_markdown}\n"
+    cfg = {
+        "api_format": pr.get("api_format", "openai"),
+        "base_url": pr.get("base_url", ""),
+        "model_identifier": pr.get("model_identifier"),
+        "token": pr["api_key"],
+        "max_tokens": 64,
+        "generation_params": json.loads(pr["generation_params"]) if pr.get("generation_params") else {},
+    }
+    try:
+        verdict = llm_json_from_text(llm_complete(cfg, system, user))
+    except Exception:
+        return True
+    if isinstance(verdict, dict) and isinstance(verdict.get("materially_different"), bool):
+        return verdict["materially_different"]
+    return True
+
+
+@router.post("/v1/skills/ingest")
+async def ingest_skill(auth: Auth, request: Request):
+    body = await request.json()
+
+    name = (body.get("name") or "").strip() if isinstance(body.get("name"), str) else ""
+    markdown = str(body.get("markdown") or "")
+    if not name:
+        json_error("missing_field", 'Field "name" is required.', 400)
+    if not markdown.strip():
+        json_error("missing_field", 'Field "markdown" (the SKILL.md text) is required.', 400)
+
+    frontmatter = body.get("frontmatter") if isinstance(body.get("frontmatter"), dict) else {}
+    model = str(body["model"]).strip() if body.get("model") else None
+    preview = bool(body.get("preview"))
+
+    files = _decode_files(body, name, markdown)
+    computed_hash = bundle_hash(files)
+
+    # maludb_skill_register arrived in 0.97.0 (with the bundle schema).
+    has_register = db_one(
+        auth.conn,
+        "SELECT EXISTS(SELECT 1 FROM pg_proc WHERE proname = 'maludb_skill_register') AS ok",
+    )
+    if not has_register or not has_register["ok"]:
+        json_error(
+            "ingest_unavailable",
+            "maludb_skill_register is not available (requires maludb_core 0.97.0;"
+            " re-run enable_memory_schema('<tenant>') after upgrading).",
+            501,
+        )
+
+    # Idempotent re-push: same name + bundle -> the existing version, no LLM.
+    existing = db_one(
+        auth.conn,
+        "SELECT skill_id AS id, version FROM maludb_skill WHERE skill_name = %s AND bundle_hash = %s",
+        [name, computed_hash],
+    )
+    if existing and not preview:
+        return {
+            "skill_id": int(existing["id"]),
+            "version": existing["version"],
+            "bundle_hash": computed_hash,
+            "reused": True,
+        }
+
+    # Parent: explicit {owner_schema, skill_id}, else the newest enabled
+    # same-name skill in the tenant's own schema (the re-upload case).
+    parent_schema = None
+    parent_id = None
+    parent_note = None
+    parent_body = body.get("parent")
+    if isinstance(parent_body, dict) and parent_body.get("skill_id") is not None:
+        parent_schema = str(parent_body.get("owner_schema") or "").strip() or None
+        parent_id = int(parent_body["skill_id"])
+        if parent_schema is None:
+            json_error("validation_failed", 'Field "parent.owner_schema" is required with parent.skill_id.', 422)
+    else:
+        auto = db_one(
+            auth.conn,
+            """SELECT skill_id AS id, owner_schema FROM maludb_skill
+                WHERE skill_name = %s AND enabled ORDER BY skill_id DESC LIMIT 1""",
+            [name],
+        )
+        if auto:
+            parent_schema = auto["owner_schema"]
+            parent_id = int(auto["id"])
+            parent_note = "auto_detected_same_name"
+
+    # Materiality: explicit override > deterministic screens > LLM judge.
+    materiality: dict = {"verdict": "material", "reasons": ["no_parent"]}
+    materially_different = True
+    if parent_id is not None:
+        parent_row = db_one(
+            auth.conn,
+            """SELECT s.markdown, s.frontmatter_jsonb,
+                      COALESCE((SELECT jsonb_agg(jsonb_build_object(
+                                    'relative_path', f.relative_path,
+                                    'file_hash', f.file_hash))
+                                  FROM maludb_core.malu$skill_file f
+                                 WHERE f.owner_schema = s.owner_schema
+                                   AND f.skill_id = s.skill_id), '[]'::jsonb) AS files
+                 FROM maludb_core.malu$skill_package s
+                WHERE s.owner_schema = %s AND s.skill_id = %s""",
+            [parent_schema, parent_id],
+        )
+        if parent_row is None:
+            json_error("not_found", "Parent skill not found.", 404)
+        parent_files = parent_row["files"]
+        if isinstance(parent_files, str):
+            parent_files = json.loads(parent_files)
+        materiality = materiality_screens(
+            {"markdown": parent_row["markdown"], "frontmatter_jsonb": parent_row["frontmatter_jsonb"],
+             "files": parent_files},
+            markdown, frontmatter, files,
+        )
+        if isinstance(body.get("materially_different"), bool):
+            materially_different = body["materially_different"]
+            materiality["reasons"].append("caller_override")
+        elif materiality["verdict"] == "material":
+            materially_different = True
+        elif materiality["verdict"] == "non_material":
+            materially_different = False
+        else:  # gray zone
+            pr_judge = get_auth_store().model_prompt(model) if model else None
+            if pr_judge and pr_judge.get("api_key"):
+                materially_different = _judge_materiality(
+                    pr_judge, parent_row["markdown"] or "", markdown, name)
+                materiality["reasons"].append("llm_judged")
+            else:
+                materially_different = True
+                materiality["reasons"].append("gray_zone_default_material")
+        materiality["materially_different"] = materially_different
+
+    # Discovery extraction: LLM when a model is configured, else the
+    # deterministic frontmatter-only fallback.
+    extraction = None
+    discovery = None
+    if model:
+        store = get_auth_store()
+        pr = store.model_prompt(model)
+        if pr is None:
+            json_error(
+                "model_not_configured",
+                f'No prompt configured for model "{model}". Set one via POST /v1/model-prompts.',
+                422,
+            )
+        entity_block, event_block = _render_type_catalog(auth)
+        system = (
+            str(pr.get("system_prompt", ""))
+            .replace("{{ENTITY_TYPES}}", entity_block)
+            .replace("{{EVENT_KINDS}}", event_block)
+        )
+        user_msg = (
+            f"SKILL_NAME: {name}\n\nFRONTMATTER:\n{json.dumps(frontmatter, ensure_ascii=False)}\n\n"
+            f"SKILL_MD:\n{markdown}\n"
+        )
+        if preview:
+            return {
+                "model": model,
+                "system_prompt": system,
+                "user_message": user_msg,
+                "bundle_hash": computed_hash,
+                "materiality": materiality,
+                "parent": {"owner_schema": parent_schema, "skill_id": parent_id, "note": parent_note},
+            }
+        if not pr.get("api_key"):
+            json_error("model_api_key_missing", f'No API key set for model "{model}".', 409)
+        cfg = {
+            "api_format": pr.get("api_format", "openai"),
+            "base_url": pr.get("base_url", ""),
+            "model_identifier": pr.get("model_identifier") or model,
+            "token": pr["api_key"],
+            "max_tokens": int(pr.get("max_tokens", 2048)),
+            "generation_params": json.loads(pr["generation_params"]) if pr.get("generation_params") else {},
+        }
+        extraction = llm_json_from_text(llm_complete(cfg, system, user_msg))
+        if extraction is None:
+            json_error("upstream_error", "LLM output was not a JSON object.", 502)
+        extraction = coerce_skill_extraction(extraction, name, markdown, frontmatter)
+    else:
+        discovery = deterministic_discovery(name, frontmatter)
+        extraction = coerce_skill_extraction(
+            {"subjects": [], "verbs": [], "edges": [], "keywords": discovery["keywords"]},
+            name, markdown, frontmatter,
+        )
+        if preview:
+            return {
+                "model": None,
+                "extraction": extraction,
+                "bundle_hash": computed_hash,
+                "materiality": materiality,
+                "parent": {"owner_schema": parent_schema, "skill_id": parent_id, "note": parent_note},
+            }
+
+    version = str(body["version"]).strip() if body.get("version") else (
+        str((frontmatter.get("metadata") or {}).get("version") or "").strip() or None
+        if isinstance(frontmatter.get("metadata"), dict) else None
+    )
+    description = str(frontmatter.get("description") or "").strip() or None
+
+    # One transaction: graph ingest, bundle storage, skill registration.
+    def _ingest(conn):
+        ingest_row = db_one(
+            conn,
+            """SELECT maludb_memory_ingest_extraction(
+                        p_extraction => %s::jsonb, p_source_kind => 'document',
+                        p_source_id => NULL, p_provenance => 'suggested') AS result""",
+            [json.dumps(extraction)],
+        )
+        report = ingest_row["result"]
+        if isinstance(report, str):
+            report = json.loads(report)
+
+        # subject names -> graph ids, via the report's key->id map
+        ids = report.get("ids") or {}
+        subjects_param = []
+        for s in extraction.get("subjects") or []:
+            entry = {"name": s.get("name")}
+            key = s.get("key")
+            if key is not None and str(key) in ids:
+                entry["id"] = ids[str(key)]
+            subjects_param.append(entry)
+        verbs_param = [{"name": v.get("name")} for v in extraction.get("verbs") or [] if v.get("name")]
+        keywords = [str(k) for k in extraction.get("keywords") or [] if str(k).strip()]
+
+        # Bundle files: content-hash-deduped source packages in the tenant schema.
+        files_param = []
+        for f in files:
+            sp = db_one(
+                conn,
+                """SELECT source_package_id FROM maludb_source_package
+                    WHERE content_hash = %s AND source_type = 'skill_file'
+                    ORDER BY source_package_id LIMIT 1""",
+                [f["file_hash"]],
+            )
+            if sp is None:
+                sp = db_one(
+                    conn,
+                    """INSERT INTO maludb_source_package
+                           (source_type, content_bytes, media_type, content_size, content_hash, ingested_at)
+                       VALUES ('skill_file', %s, %s, %s, %s, now())
+                       RETURNING source_package_id""",
+                    [f["content"], f["media_type"], f["file_size"], f["file_hash"]],
+                )
+            files_param.append(
+                {
+                    "relative_path": f["relative_path"],
+                    "source_package_id": int(sp["source_package_id"]),
+                    "file_hash": f["file_hash"],
+                    "file_size": f["file_size"],
+                    "is_executable": f["is_executable"],
+                    "media_type": f["media_type"],
+                }
+            )
+
+        reg_row = db_one(
+            conn,
+            """SELECT maludb_skill_register(
+                        p_skill_name => %s, p_markdown => %s, p_bundle_hash => %s,
+                        p_description => %s, p_frontmatter => %s::jsonb, p_version => %s,
+                        p_keywords => %s, p_subjects => %s::jsonb, p_verbs => %s::jsonb,
+                        p_files => %s::jsonb, p_parent_owner_schema => %s,
+                        p_parent_skill_id => %s, p_materially_different => %s) AS result""",
+            [
+                name, markdown, computed_hash,
+                description, json.dumps(frontmatter), version,
+                keywords or None, json.dumps(subjects_param), json.dumps(verbs_param),
+                json.dumps(files_param), parent_schema,
+                parent_id, materially_different,
+            ],
+        )
+        register = reg_row["result"]
+        if isinstance(register, str):
+            register = json.loads(register)
+        return {"ingest": report, "register": register}
+
+    result = db_tx_core(auth.conn, _ingest)
+
+    return JSONResponse(
+        status_code=201,
+        content={
+            "skill_id": result["register"].get("skill_id"),
+            "version": result["register"].get("version"),
+            "bundle_hash": computed_hash,
+            "reused": bool(result["register"].get("reused")),
+            "model": model,
+            "parent": {"owner_schema": parent_schema, "skill_id": parent_id, "note": parent_note},
+            "materiality": materiality,
+            "register": result["register"],
+            "ingest": result["ingest"],
+        },
+    )
+
+
+# ===========================================================================
+# GET /v1/skills/{id}/bundle — full bundle for reconstruction (skill pull)
+# ===========================================================================
+
+
+@router.get("/v1/skills/{skill_id}/bundle")
+def get_skill_bundle(skill_id: int, auth: Auth):
+    skill = db_one(
+        auth.conn,
+        """SELECT skill_id AS id, skill_name AS name, description, markdown, version,
+                  visibility, enabled, bundle_hash, frontmatter_jsonb,
+                  source_owner_schema, source_skill_id, created_at
+             FROM maludb_skill WHERE skill_id = %s""",
+        [skill_id],
+    )
+    if skill is None:
+        json_error("not_found", "Skill not found.", 404)
+    skill["id"] = int(skill["id"])
+    if skill["source_skill_id"] is not None:
+        skill["source_skill_id"] = int(skill["source_skill_id"])
+    skill["enabled"] = None if skill["enabled"] is None else bool(skill["enabled"])
+
+    rows = db_query(
+        auth.conn,
+        """SELECT f.relative_path, f.file_hash, f.file_size, f.is_executable,
+                  f.media_type, sp.content_bytes, sp.content_text
+             FROM maludb_skill_file f
+             JOIN maludb_source_package sp ON sp.source_package_id = f.source_package_id
+            WHERE f.skill_id = %s
+            ORDER BY f.relative_path""",
+        [skill_id],
+    )
+    files = []
+    for r in rows:
+        content = bytes(r["content_bytes"]) if r["content_bytes"] is not None else (
+            r["content_text"] or "").encode("utf-8")
+        files.append(
+            {
+                "relative_path": r["relative_path"],
+                "file_hash": r["file_hash"],
+                "file_size": int(r["file_size"]),
+                "is_executable": bool(r["is_executable"]),
+                "media_type": r["media_type"],
+                "content_base64": base64.b64encode(content).decode("ascii"),
+            }
+        )
+
+    # Older (pre-bundle) markdown skills still pull as a one-file bundle.
+    if not files and skill.get("markdown"):
+        content = str(skill["markdown"]).encode("utf-8")
+        files.append(
+            {
+                "relative_path": "SKILL.md",
+                "file_hash": file_sha256(content),
+                "file_size": len(content),
+                "is_executable": False,
+                "media_type": "text/markdown",
+                "content_base64": base64.b64encode(content).decode("ascii"),
+            }
+        )
+
+    return {"skill": skill, "files": files}
