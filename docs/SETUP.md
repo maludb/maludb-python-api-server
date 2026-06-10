@@ -193,7 +193,35 @@ curl -s -X DELETE http://localhost:8000/v1/tokens/1 \
 
 ## 5. Register an LLM extractor model
 
-To turn free-text notes into graph data, register a model with its system prompt and API key.
+### The easy way: pick a seeded model (recommended)
+
+The server seeds a catalog of default prompts for common models on first start
+(`default_prompts` in `data/auth.db` — OpenAI, Anthropic, Google, xAI, DeepSeek, Ollama).
+With just your bearer token, store your provider key and pick a model per task:
+
+```bash
+# What's available (per task: extract, skill_extract, embed)
+curl -s http://localhost:8000/v1/llm/catalog -H "Authorization: Bearer $TOKEN" | jq .
+
+# Store your provider API key (never returned by the API afterwards)
+curl -s -X PUT http://localhost:8000/v1/llm/providers/openai \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"api_key":"sk-YOUR_OPENAI_KEY"}' | jq .
+
+# Choose your extraction model (and optionally an embed model)
+curl -s -X PUT http://localhost:8000/v1/llm/models/extract \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"model_name":"gpt-4o"}' | jq .
+```
+
+After that, `POST /v1/memory/ingest` without a `model` field uses your choice.
+Keys and choices are per `user_id` (all your tokens share them). The
+`maludb-terminal` CLI wraps these as `malu llm set-key` / `malu llm use`.
+
+### The legacy way: register a model + prompt by hand
+
+To register a fully custom model/prompt (or on older deployments), use
+`/v1/model-prompts` with its system prompt and API key.
 A ready-made GPT-4o extraction prompt ships in `config/prompts/chatgpt-4o.system.txt`.
 
 > **Auth note:** `/v1/model-prompts` is authorized by the **Postgres login in the body**, *not*
@@ -477,8 +505,11 @@ with `psql`, you must set it yourself:
 | `POST /v1/tokens` | PG login (body) | Mint a token |
 | `GET /v1/tokens` | PG login (body) | List token prefixes |
 | `DELETE /v1/tokens/{id}` | PG login (body) | Revoke a token |
-| `POST /v1/model-prompts` | PG login (body) | Register/update an LLM extractor |
-| `GET /v1/model-prompts` | PG login (body) | List configured models |
+| `POST /v1/model-prompts` | PG login (body) | Register/update an LLM extractor (legacy) |
+| `GET /v1/model-prompts` | PG login (body) | List configured models (legacy) |
+| `GET /v1/llm/catalog` | Bearer token | Seeded model catalog (models × tasks) |
+| `GET/PUT/DELETE /v1/llm/providers…` | Bearer token | Your LLM provider API keys |
+| `GET/PUT/DELETE /v1/llm/models…` | Bearer token | Your task → model choices |
 | `POST /v1/memory/ingest` | Bearer token | Text → LLM extraction → graph |
 | `POST /v1/memory/documents` | Bearer token | Upload/chunk/embed/ingest (or supply `edges`) |
 | `POST /v1/memory/search` | Bearer token | Embed query + vector search |

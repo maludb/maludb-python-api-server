@@ -37,6 +37,7 @@ from app.helpers.llm import (
     mem_resolve_token,
     mem_vector_literal,
 )
+from app.helpers.llm_resolve import resolve_embed_config, resolve_task_config
 
 router = APIRouter()
 
@@ -254,10 +255,15 @@ async def memory_documents(auth: Auth, request: Request):
     # Model config — Store A (namespace) is primary here.
     cfg_raw = _namespace_config(auth.conn, namespace)
 
+    # Embedding model precedence: body > namespace config > the user's
+    # 'embed' choice > env default.
+    user_embed = resolve_embed_config(get_auth_store(), auth.user_id)
     embedding_model = (
         str(body["embedding_model"]).strip()
         if body.get("embedding_model") and str(body["embedding_model"]).strip()
-        else cfg_raw.get("embedding_model") or os.environ.get("MALUDB_EMBED_MODEL", "maludb-local-dev")
+        else cfg_raw.get("embedding_model")
+        or user_embed.get("embedding_model")
+        or os.environ.get("MALUDB_EMBED_MODEL", "maludb-local-dev")
     )
     default_subject = cfg_raw.get("default_subject_type", "other")
     default_prov = cfg_raw.get("default_provenance", "suggested")
@@ -277,13 +283,20 @@ async def memory_documents(auth: Auth, request: Request):
             "token": mem_resolve_token(auth.conn, cfg_raw.get("secret_ref")),
         }
     else:
-        fb_model = str(body.get("model") or "chatgpt-4o").strip() or "chatgpt-4o"
-        pr = get_auth_store().model_prompt(fb_model)
+        # Borrow a connection from Store B: explicit model -> the user's
+        # 'extract' choice -> the legacy 'chatgpt-4o' model_prompts row.
+        # Only the connection crosses over — the candidate_edges contract
+        # (prompt_template) never comes from Store B.
+        fb_model = str(body.get("model") or "").strip() or None
+        store_b = get_auth_store()
+        pr = resolve_task_config(store_b, auth.user_id, "extract", fb_model)
+        if pr is None:
+            pr = store_b.model_prompt(fb_model or "chatgpt-4o")
         if pr and str(pr.get("base_url") or "").strip():
             extract_cfg = {
                 "api_format": pr.get("api_format", "openai"),
                 "base_url": pr.get("base_url", ""),
-                "model_identifier": pr.get("model_identifier") or fb_model,
+                "model_identifier": pr.get("model_identifier") or pr.get("model_name") or "",
                 "prompt_template": cfg_raw.get("prompt_template"),  # default candidate_edges template
                 "generation_params": json.loads(pr["generation_params"]) if pr.get("generation_params") else {},
                 "max_tokens": int(pr.get("max_tokens", 2048)),
@@ -303,8 +316,9 @@ async def memory_documents(auth: Auth, request: Request):
             }
 
     model_id = str(extract_cfg.get("model_identifier") or "")
-    # Embedding config
-    embed_cfg: dict[str, str] = {"embedding_model": embedding_model}
+    # Embedding config — the user's stored embed connection (if any), with the
+    # resolved embedding_model name on top.
+    embed_cfg: dict[str, str] = {**user_embed, "embedding_model": embedding_model}
 
     # 1. Obtain candidate edges: caller-supplied (bypass) OR LLM extraction per chunk
     provided = body.get("edges") if isinstance(body.get("edges"), list) else None
@@ -436,16 +450,20 @@ async def memory_search(auth: Auth, request: Request):
     limit = max(1, min(200, int(body.get("limit", 20))))
     metric = str(body.get("metric") or "cosine").strip() or "cosine"
 
-    # Same embedding model as ingest
+    # Same embedding model (and precedence) as document ingest:
+    # body > namespace config > the user's 'embed' choice > env default.
     cfg_raw = _namespace_config(auth.conn, namespace)
+    user_embed = resolve_embed_config(get_auth_store(), auth.user_id)
 
     embedding_model = (
         str(body["embedding_model"]).strip()
         if body.get("embedding_model") and str(body["embedding_model"]).strip()
-        else cfg_raw.get("embedding_model") or os.environ.get("MALUDB_EMBED_MODEL", "maludb-local-dev")
+        else cfg_raw.get("embedding_model")
+        or user_embed.get("embedding_model")
+        or os.environ.get("MALUDB_EMBED_MODEL", "maludb-local-dev")
     )
 
-    vector = mem_vector_literal(mem_embed(query, {"embedding_model": embedding_model}))
+    vector = mem_vector_literal(mem_embed(query, {**user_embed, "embedding_model": embedding_model}))
 
     rows = db_tx_core(
         auth.conn,
@@ -489,7 +507,7 @@ async def memory_ingest(auth: Auth, request: Request):
     if not text.strip():
         json_error("missing_field", 'Field "text" is required.', 400)
 
-    model = str(body.get("model") or "chatgpt-4o").strip() or "chatgpt-4o"
+    explicit_model = str(body.get("model") or "").strip() or None
     namespace = str(body.get("namespace") or "default").strip() or "default"
     preview = bool(body.get("preview"))
 
@@ -510,9 +528,15 @@ async def memory_ingest(auth: Auth, request: Request):
     else:
         hints_json = "[]"
 
-    # Per-model prompt + LLM connection — Store B (SQLite model_prompts) is primary.
+    # Per-model prompt + LLM connection.  Resolution order: explicit model
+    # (legacy model_prompts first, then the seeded catalog + the user's
+    # provider key) -> the user's 'extract' choice -> the legacy default
+    # ('chatgpt-4o' model_prompts row) -> the namespace config (Store A).
     store = get_auth_store()
-    pr = store.model_prompt(model)
+    pr = resolve_task_config(store, auth.user_id, "extract", explicit_model)
+    model = pr["model_name"] if pr is not None else (explicit_model or "chatgpt-4o")
+    if pr is None:
+        pr = store.model_prompt(model)
     if pr is None:
         # No model_prompt: fall back to Store A (the Postgres namespace config).
         # Borrow its LLM connection and pair it with the default ingest system
@@ -595,7 +619,13 @@ async def memory_ingest(auth: Auth, request: Request):
         }
 
     if not pr.get("api_key"):
-        msg = f'No API key set for model "{model}". Set it via POST /v1/model-prompts.'
+        if pr.get("source") in ("catalog_explicit", "user_choice"):
+            msg = (
+                f'No API key stored for provider "{pr.get("provider")}".'
+                f" Set one via PUT /v1/llm/providers/{pr.get('provider')}."
+            )
+        else:
+            msg = f'No API key set for model "{model}". Set it via POST /v1/model-prompts.'
         json_error("model_api_key_missing", msg, 409)
 
     # Verify maludb_memory_ingest_extraction is available

@@ -33,6 +33,7 @@ from app.auth import Auth, get_auth_store
 from app.database import db_exec, db_one, db_query, db_tx_core
 from app.errors import json_error
 from app.helpers.llm import llm_complete, llm_json_from_text
+from app.helpers.llm_resolve import resolve_task_config
 from app.helpers.skills import (
     bundle_hash,
     coerce_skill_extraction,
@@ -553,7 +554,7 @@ async def ingest_skill(auth: Auth, request: Request):
         elif materiality["verdict"] == "non_material":
             materially_different = False
         else:  # gray zone
-            pr_judge = get_auth_store().model_prompt(model) if model else None
+            pr_judge = resolve_task_config(get_auth_store(), auth.user_id, "skill_extract", model)
             if pr_judge and pr_judge.get("api_key"):
                 materially_different = _judge_materiality(
                     pr_judge, parent_row["markdown"] or "", markdown, name)
@@ -563,19 +564,21 @@ async def ingest_skill(auth: Auth, request: Request):
                 materiality["reasons"].append("gray_zone_default_material")
         materiality["materially_different"] = materially_different
 
-    # Discovery extraction: LLM when a model is configured, else the
-    # deterministic frontmatter-only fallback.
+    # Discovery extraction: LLM when a model is configured (explicit `model`,
+    # or the user's stored 'skill_extract' choice), else the deterministic
+    # frontmatter-only fallback.
     extraction = None
     discovery = None
-    if model:
-        store = get_auth_store()
-        pr = store.model_prompt(model)
-        if pr is None:
-            json_error(
-                "model_not_configured",
-                f'No prompt configured for model "{model}". Set one via POST /v1/model-prompts.',
-                422,
-            )
+    store = get_auth_store()
+    pr = resolve_task_config(store, auth.user_id, "skill_extract", model)
+    if model and pr is None:
+        json_error(
+            "model_not_configured",
+            f'No prompt configured for model "{model}". Set one via POST /v1/model-prompts.',
+            422,
+        )
+    if pr is not None:
+        model = pr.get("model_name") or model
         entity_block, event_block = _render_type_catalog(auth)
         system = (
             str(pr.get("system_prompt", ""))
@@ -596,7 +599,14 @@ async def ingest_skill(auth: Auth, request: Request):
                 "parent": {"owner_schema": parent_schema, "skill_id": parent_id, "note": parent_note},
             }
         if not pr.get("api_key"):
-            json_error("model_api_key_missing", f'No API key set for model "{model}".', 409)
+            if pr.get("source") in ("catalog_explicit", "user_choice"):
+                msg = (
+                    f'No API key stored for provider "{pr.get("provider")}".'
+                    f" Set one via PUT /v1/llm/providers/{pr.get('provider')}."
+                )
+            else:
+                msg = f'No API key set for model "{model}".'
+            json_error("model_api_key_missing", msg, 409)
         cfg = {
             "api_format": pr.get("api_format", "openai"),
             "base_url": pr.get("base_url", ""),
