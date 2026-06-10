@@ -126,12 +126,11 @@ _SQLSTATE_CLASS: dict[str, tuple[int, str]] = {
 }
 
 
-async def database_error_handler(_request: Request, exc: Exception) -> JSONResponse:
-    """Handle psycopg.errors.DatabaseError → map SQLSTATE to a specific HTTP error.
+def classify_database_error(exc: Exception) -> tuple[int, str, str | None]:
+    """Map a psycopg DatabaseError to (http_status, error_code, sqlstate).
 
     Resolution order: exact SQLSTATE, then the two-character class, then a final
-    generic 500. The real Postgres message and the SQLSTATE are always included
-    so the failure is debuggable instead of an opaque "unexpected error".
+    generic 500. Shared by the FastAPI exception handler and the MCP dispatcher.
     """
     # psycopg v3 exceptions carry sqlstate as exc.sqlstate (or via diag).
     sqlstate: str | None = getattr(exc, "sqlstate", None)
@@ -146,6 +145,16 @@ async def database_error_handler(_request: Request, exc: Exception) -> JSONRespo
         status, code = _SQLSTATE_CLASS[sqlstate[:2]]
     else:
         status, code = 500, "internal_error"
+    return status, code, sqlstate
+
+
+async def database_error_handler(_request: Request, exc: Exception) -> JSONResponse:
+    """Handle psycopg.errors.DatabaseError → map SQLSTATE to a specific HTTP error.
+
+    The real Postgres message and the SQLSTATE are always included so the
+    failure is debuggable instead of an opaque "unexpected error".
+    """
+    status, code, sqlstate = classify_database_error(exc)
 
     error: dict[str, str] = {"code": code, "message": _pg_error_message(exc)}
     if sqlstate:

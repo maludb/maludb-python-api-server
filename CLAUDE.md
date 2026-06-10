@@ -76,6 +76,7 @@ app/
     ├── objects.py       # /v1/objects/{kind} (atomic create)
     ├── graph.py         # /v1/edges, /v1/graph/neighbors, /v1/graph/walk
     ├── memory.py        # /v1/memory/* (LLM + vector pipeline)
+    ├── mcp.py           # POST /mcp — MCP server (stateless Streamable HTTP, 8 tools)
     ├── llm_config.py    # /v1/llm/* (catalog, provider keys, task→model choices)
     ├── tokens.py        # /v1/tokens (self-service auth)
     ├── model_prompts.py # /v1/model-prompts

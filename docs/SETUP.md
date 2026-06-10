@@ -25,6 +25,7 @@ so you don't have to figure anything out as you go.
 10. [Verification checklist](#10-verification-checklist)
 11. [Troubleshooting](#11-troubleshooting)
 12. [Reference — endpoints & environment variables](#12-reference)
+13. [Connect an MCP client (Claude Code / Claude Desktop)](#13-connect-an-mcp-client)
 
 Throughout, **replace placeholders in `UPPER_CASE`** with your own values. The examples use the
 project defaults (`maludb` / `app` / `#change_on_install#`); substitute yours if different.
@@ -546,4 +547,45 @@ verifies by connecting. "Bearer token" = `Authorization: Bearer malu_…`.
 ```
 install project → §1 prerequisites → §2 env → §3 start → §4 token
    → §5 register model → §6 ingest → (§7 embeddings) → §8/§9 expose & service
+```
+
+---
+
+## 13. Connect an MCP client
+
+The server exposes a **Model Context Protocol** endpoint at `POST /mcp`
+(stateless Streamable HTTP, spec 2025-06-18) so agents can use MaluDB as
+long-term memory directly. It authenticates with the same Bearer tokens as the
+REST API (§4) — tools run as the token's user, so your per-user model choices
+(§5, `/v1/llm/*`) apply automatically.
+
+Register in Claude Code:
+
+```bash
+claude mcp add --transport http maludb http://localhost:8000/mcp \
+  --header "Authorization: Bearer $TOKEN"
+```
+
+**Tools** (read-only unless noted):
+- `store_memory` *(write)* — note → LLM extraction → knowledge graph
+- `search_memory` — semantic vector search (requires a subject/verb pre-filter;
+  the error suggests matching subjects when omitted)
+- `find_subjects` — list canonical entities (grounding for the other tools)
+- `explore_subject` — graph neighbors / multi-hop walk around one entity
+- `store_document` *(write)* — full document: chunk + extract + embed + ingest
+- `get_document` — document metadata + tags by id
+- `find_skills` / `get_skill` — discover stored agent skills; fetch metadata,
+  SKILL.md, and the file listing (full bundles stay on the REST API)
+
+`store_memory`/`store_document` need an extraction model (§5) and benefit from
+real embeddings (§7).
+
+Curl smoke test:
+
+```bash
+M="http://localhost:8000/mcp"; H1='Content-Type: application/json'; H2="Authorization: Bearer $TOKEN"
+curl -s $M -H "$H1" -H "$H2" -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"curl","version":"0"}}}' | jq .result.serverInfo
+curl -si $M -H "$H1" -H "$H2" -d '{"jsonrpc":"2.0","method":"notifications/initialized"}' | head -1   # HTTP 202
+curl -s $M -H "$H1" -H "$H2" -d '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' | jq '.result.tools | length'   # 8
+curl -s $M -H "$H1" -H "$H2" -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"find_subjects","arguments":{"limit":5}}}' | jq .
 ```

@@ -243,25 +243,68 @@ async def memory_documents(auth: Auth, request: Request):
     doc_type = str(_dt).strip() if _dt and str(_dt).strip() else None
     metadata = json.dumps(body["metadata"]) if isinstance(body.get("metadata"), dict) else "{}"
 
-    projects = _to_text_array(body.get("projects"))
-    subjects = _to_text_array(body.get("subjects"))
-    verbs = _to_text_array(body.get("verbs"))
-    events = _to_text_array(body.get("events"))
-
     chunk_cfg = body.get("chunk") if isinstance(body.get("chunk"), dict) else {}
-    chunk_max = max(200, int(chunk_cfg.get("max", 2000)))
-    chunk_overlap = max(0, int(chunk_cfg.get("overlap", 200)))
+
+    payload = documents_core(
+        auth,
+        title=title,
+        text=text,
+        source_type=source_type,
+        media_type=media_type,
+        document_type=doc_type,
+        metadata_json=metadata,
+        projects=_to_text_array(body.get("projects")),
+        subjects=_to_text_array(body.get("subjects")),
+        verbs=_to_text_array(body.get("verbs")),
+        events=_to_text_array(body.get("events")),
+        chunk_max=max(200, int(chunk_cfg.get("max", 2000))),
+        chunk_overlap=max(0, int(chunk_cfg.get("overlap", 200))),
+        embedding_model=(
+            str(body["embedding_model"]).strip()
+            if body.get("embedding_model") and str(body["embedding_model"]).strip()
+            else None
+        ),
+        explicit_model=str(body.get("model") or "").strip() or None,
+        provided_edges=body.get("edges") if isinstance(body.get("edges"), list) else None,
+        namespace=namespace,
+    )
+    return JSONResponse(status_code=201, content=payload)
+
+
+def documents_core(
+    auth,
+    *,
+    title: str,
+    text: str,
+    source_type: str,
+    media_type: str | None,
+    document_type: str | None,
+    metadata_json: str,
+    projects: list[str],
+    subjects: list[str],
+    verbs: list[str],
+    events: list[str],
+    chunk_max: int,
+    chunk_overlap: int,
+    embedding_model: str | None,
+    explicit_model: str | None,
+    provided_edges: list | None,
+    namespace: str,
+) -> dict:
+    """The documents pipeline (chunk → extract → embed → ingest), shared by the
+    REST route and the MCP store_document tool.  Raises APIError on failure."""
+    doc_type = document_type
+    metadata = metadata_json
 
     # Model config — Store A (namespace) is primary here.
     cfg_raw = _namespace_config(auth.conn, namespace)
 
-    # Embedding model precedence: body > namespace config > the user's
+    # Embedding model precedence: caller > namespace config > the user's
     # 'embed' choice > env default.
     user_embed = resolve_embed_config(get_auth_store(), auth.user_id)
     embedding_model = (
-        str(body["embedding_model"]).strip()
-        if body.get("embedding_model") and str(body["embedding_model"]).strip()
-        else cfg_raw.get("embedding_model")
+        embedding_model
+        or cfg_raw.get("embedding_model")
         or user_embed.get("embedding_model")
         or os.environ.get("MALUDB_EMBED_MODEL", "maludb-local-dev")
     )
@@ -287,7 +330,7 @@ async def memory_documents(auth: Auth, request: Request):
         # 'extract' choice -> the legacy 'chatgpt-4o' model_prompts row.
         # Only the connection crosses over — the candidate_edges contract
         # (prompt_template) never comes from Store B.
-        fb_model = str(body.get("model") or "").strip() or None
+        fb_model = explicit_model
         store_b = get_auth_store()
         pr = resolve_task_config(store_b, auth.user_id, "extract", fb_model)
         if pr is None:
@@ -321,7 +364,7 @@ async def memory_documents(auth: Auth, request: Request):
     embed_cfg: dict[str, str] = {**user_embed, "embedding_model": embedding_model}
 
     # 1. Obtain candidate edges: caller-supplied (bypass) OR LLM extraction per chunk
-    provided = body.get("edges") if isinstance(body.get("edges"), list) else None
+    provided = provided_edges
     chunks = mem_chunk(text, chunk_max, chunk_overlap)
 
     edges: list[dict] = []
@@ -414,17 +457,14 @@ async def memory_documents(auth: Auth, request: Request):
 
     result = db_tx_core(auth.conn, _ingest)
 
-    return JSONResponse(
-        status_code=201,
-        content={
-            "document_id": result["document_id"],
-            "namespace": namespace,
-            "embedding_model": embedding_model,
-            "extractor": extractor,
-            "chunk_count": len(chunks),
-            "edges": result["edges"],
-        },
-    )
+    return {
+        "document_id": result["document_id"],
+        "namespace": namespace,
+        "embedding_model": embedding_model,
+        "extractor": extractor,
+        "chunk_count": len(chunks),
+        "edges": result["edges"],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -450,15 +490,43 @@ async def memory_search(auth: Auth, request: Request):
     limit = max(1, min(200, int(body.get("limit", 20))))
     metric = str(body.get("metric") or "cosine").strip() or "cosine"
 
+    return search_core(
+        auth,
+        query=query,
+        subject=subject,
+        verb=verb,
+        namespace=namespace,
+        limit=limit,
+        metric=metric,
+        embedding_model=(
+            str(body["embedding_model"]).strip()
+            if body.get("embedding_model") and str(body["embedding_model"]).strip()
+            else None
+        ),
+    )
+
+
+def search_core(
+    auth,
+    *,
+    query: str,
+    subject: str | None,
+    verb: str | None,
+    namespace: str,
+    limit: int,
+    metric: str,
+    embedding_model: str | None,
+) -> dict:
+    """Embed the query and run the vector search, shared by the REST route and
+    the MCP search_memory tool.  Raises APIError on failure."""
     # Same embedding model (and precedence) as document ingest:
-    # body > namespace config > the user's 'embed' choice > env default.
+    # caller > namespace config > the user's 'embed' choice > env default.
     cfg_raw = _namespace_config(auth.conn, namespace)
     user_embed = resolve_embed_config(get_auth_store(), auth.user_id)
 
     embedding_model = (
-        str(body["embedding_model"]).strip()
-        if body.get("embedding_model") and str(body["embedding_model"]).strip()
-        else cfg_raw.get("embedding_model")
+        embedding_model
+        or cfg_raw.get("embedding_model")
         or user_embed.get("embedding_model")
         or os.environ.get("MALUDB_EMBED_MODEL", "maludb-local-dev")
     )
@@ -528,6 +596,31 @@ async def memory_ingest(auth: Auth, request: Request):
     else:
         hints_json = "[]"
 
+    payload = ingest_core(
+        auth,
+        text=text,
+        hints_json=hints_json,
+        namespace=namespace,
+        explicit_model=explicit_model,
+        preview=preview,
+    )
+    if preview:
+        return payload
+    return JSONResponse(status_code=201, content=payload)
+
+
+def ingest_core(
+    auth,
+    *,
+    text: str,
+    hints_json: str,
+    namespace: str,
+    explicit_model: str | None,
+    preview: bool,
+) -> dict:
+    """The ingest pipeline (resolve model → assemble prompt → LLM → graph
+    ingest), shared by the REST route and the MCP store_memory tool.  Returns
+    the response payload dict; raises APIError on failure."""
     # Per-model prompt + LLM connection.  Resolution order: explicit model
     # (legacy model_prompts first, then the seeded catalog + the user's
     # provider key) -> the user's 'extract' choice -> the legacy default
@@ -677,13 +770,10 @@ async def memory_ingest(auth: Auth, request: Request):
 
     result = db_tx_core(auth.conn, _ingest)
 
-    return JSONResponse(
-        status_code=201,
-        content={
-            "document_id": result["document_id"],
-            "model": model,
-            "api_format": pr.get("api_format", "openai"),
-            "namespace": namespace,
-            "result": result["result"],
-        },
-    )
+    return {
+        "document_id": result["document_id"],
+        "model": model,
+        "api_format": pr.get("api_format", "openai"),
+        "namespace": namespace,
+        "result": result["result"],
+    }
