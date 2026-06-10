@@ -24,6 +24,7 @@ from typing import Any
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
+from app import config
 from app.auth import Auth, get_auth_store
 from app.database import db_one, db_query, db_tx_core
 from app.errors import json_error
@@ -38,6 +39,61 @@ from app.helpers.llm import (
 )
 
 router = APIRouter()
+
+
+# ---------------------------------------------------------------------------
+# Two model stores, with cross-fallback
+# ---------------------------------------------------------------------------
+#
+# Model configuration lives in two independent stores:
+#
+#   Store A — Postgres per-namespace config (maludb_memory_model_config).
+#             Primary for /v1/memory/documents and /v1/memory/search.
+#   Store B — SQLite model_prompts (auth_store.model_prompt).
+#             Primary for /v1/memory/ingest (and the skills pipeline).
+#
+# A tenant may have set up only one of them.  These helpers let each endpoint
+# borrow the *LLM connection* (base_url / model / token / generation_params /
+# api_format) from the other store when its own store is empty, so a partial
+# setup does not produce hard "model_not_configured" errors.  The prompt itself
+# is never crossed over: each endpoint keeps its own contract (candidate_edges
+# for documents, the ingest-extraction JSON for ingest).
+
+# Default ingest system prompt, used when /v1/memory/ingest falls back to the
+# namespace store (which has no ingest-contract prompt of its own).
+_DEFAULT_INGEST_PROMPT_FILE = config.PROJECT_ROOT / "config" / "prompts" / "chatgpt-4o.system.txt"
+_FALLBACK_INGEST_PROMPT = (
+    "You are a memory-extraction service. Convert the TEXT plus CONTEXT HINTS into a "
+    "SINGLE JSON object describing the entities, events, and relationships it contains, "
+    "ingestible directly into a knowledge graph. Output ONLY one JSON object — no prose, "
+    "no markdown. Choose subject types from these ENTITY TYPES:\n{{ENTITY_TYPES}}\n"
+    "and these EVENT KINDS:\n{{EVENT_KINDS}}\nUse small canonical verbs and reuse "
+    "KNOWN_SUBJECTS / KNOWN_VERBS where they match. Do not invent details."
+)
+
+
+def _namespace_config(conn, namespace: str) -> dict:
+    """Read the Postgres per-namespace model config (Store A); {} if none set."""
+    row = db_tx_core(conn, lambda c: db_one(c, "SELECT maludb_memory_model_config(%s) AS cfg", [namespace]))
+    if row and row["cfg"] is not None:
+        cfg = row["cfg"] if isinstance(row["cfg"], dict) else json.loads(row["cfg"])
+        if isinstance(cfg, dict):
+            return cfg
+    return {}
+
+
+def _has_llm_connection(cfg_raw: dict) -> bool:
+    """True if a namespace config carries a usable extraction connection."""
+    return bool(str(cfg_raw.get("base_url") or "").strip() and str(cfg_raw.get("model_identifier") or "").strip())
+
+
+def _default_ingest_prompt() -> str:
+    """The ingest-contract system prompt to use when no model_prompt is configured."""
+    try:
+        text = _DEFAULT_INGEST_PROMPT_FILE.read_text()
+        return text if text.strip() else _FALLBACK_INGEST_PROMPT
+    except OSError:
+        return _FALLBACK_INGEST_PROMPT
 
 
 # ---------------------------------------------------------------------------
@@ -195,13 +251,8 @@ async def memory_documents(auth: Auth, request: Request):
     chunk_max = max(200, int(chunk_cfg.get("max", 2000)))
     chunk_overlap = max(0, int(chunk_cfg.get("overlap", 200)))
 
-    # Config from DB
-    row = db_tx_core(auth.conn, lambda c: db_one(c, "SELECT maludb_memory_model_config(%s) AS cfg", [namespace]))
-    cfg_raw = {}
-    if row and row["cfg"] is not None:
-        cfg_raw = row["cfg"] if isinstance(row["cfg"], dict) else json.loads(row["cfg"])
-        if not isinstance(cfg_raw, dict):
-            cfg_raw = {}
+    # Model config — Store A (namespace) is primary here.
+    cfg_raw = _namespace_config(auth.conn, namespace)
 
     embedding_model = (
         str(body["embedding_model"]).strip()
@@ -210,16 +261,48 @@ async def memory_documents(auth: Auth, request: Request):
     )
     default_subject = cfg_raw.get("default_subject_type", "other")
     default_prov = cfg_raw.get("default_provenance", "suggested")
-    model_id = cfg_raw.get("model_identifier", "")
 
-    # Extraction config for the LLM call
-    extract_cfg = {
-        "base_url": cfg_raw.get("base_url", ""),
-        "model_identifier": model_id,
-        "prompt_template": cfg_raw.get("prompt_template"),
-        "generation_params": cfg_raw.get("generation_params", {}),
-        "token": mem_resolve_token(auth.conn, cfg_raw.get("secret_ref")),
-    }
+    # Extraction connection: Store A (namespace) first, else borrow from Store B
+    # (model_prompts) so a tenant that only configured /v1/memory/ingest can still
+    # extract here.  The candidate_edges contract (prompt_template) is never taken
+    # from Store B — its prompt targets a different contract.
+    if _has_llm_connection(cfg_raw):
+        extract_cfg = {
+            "api_format": "openai",
+            "base_url": cfg_raw.get("base_url", ""),
+            "model_identifier": cfg_raw.get("model_identifier", ""),
+            "prompt_template": cfg_raw.get("prompt_template"),
+            "generation_params": cfg_raw.get("generation_params", {}),
+            "max_tokens": 2048,
+            "token": mem_resolve_token(auth.conn, cfg_raw.get("secret_ref")),
+        }
+    else:
+        fb_model = str(body.get("model") or "chatgpt-4o").strip() or "chatgpt-4o"
+        pr = get_auth_store().model_prompt(fb_model)
+        if pr and str(pr.get("base_url") or "").strip():
+            extract_cfg = {
+                "api_format": pr.get("api_format", "openai"),
+                "base_url": pr.get("base_url", ""),
+                "model_identifier": pr.get("model_identifier") or fb_model,
+                "prompt_template": cfg_raw.get("prompt_template"),  # default candidate_edges template
+                "generation_params": json.loads(pr["generation_params"]) if pr.get("generation_params") else {},
+                "max_tokens": int(pr.get("max_tokens", 2048)),
+                "token": pr.get("api_key"),
+            }
+        else:
+            # Neither store configured — only caller-supplied "edges" can be ingested;
+            # mem_extract (if reached) raises model_not_configured.
+            extract_cfg = {
+                "api_format": "openai",
+                "base_url": "",
+                "model_identifier": "",
+                "prompt_template": cfg_raw.get("prompt_template"),
+                "generation_params": cfg_raw.get("generation_params", {}),
+                "max_tokens": 2048,
+                "token": mem_resolve_token(auth.conn, cfg_raw.get("secret_ref")),
+            }
+
+    model_id = str(extract_cfg.get("model_identifier") or "")
     # Embedding config
     embed_cfg: dict[str, str] = {"embedding_model": embedding_model}
 
@@ -354,12 +437,7 @@ async def memory_search(auth: Auth, request: Request):
     metric = str(body.get("metric") or "cosine").strip() or "cosine"
 
     # Same embedding model as ingest
-    row = db_tx_core(auth.conn, lambda c: db_one(c, "SELECT maludb_memory_model_config(%s) AS cfg", [namespace]))
-    cfg_raw = {}
-    if row and row["cfg"] is not None:
-        cfg_raw = row["cfg"] if isinstance(row["cfg"], dict) else json.loads(row["cfg"])
-        if not isinstance(cfg_raw, dict):
-            cfg_raw = {}
+    cfg_raw = _namespace_config(auth.conn, namespace)
 
     embedding_model = (
         str(body["embedding_model"]).strip()
@@ -432,12 +510,32 @@ async def memory_ingest(auth: Auth, request: Request):
     else:
         hints_json = "[]"
 
-    # Per-model prompt + LLM connection from SQLite
+    # Per-model prompt + LLM connection — Store B (SQLite model_prompts) is primary.
     store = get_auth_store()
     pr = store.model_prompt(model)
     if pr is None:
-        msg = f'No prompt configured for model "{model}". Set one via POST /v1/model-prompts.'
-        json_error("model_not_configured", msg, 422)
+        # No model_prompt: fall back to Store A (the Postgres namespace config).
+        # Borrow its LLM connection and pair it with the default ingest system
+        # prompt — the namespace prompt_template targets the candidate_edges
+        # contract, not the ingest contract, so it is not reused here.
+        cfg_raw = _namespace_config(auth.conn, namespace)
+        if _has_llm_connection(cfg_raw):
+            pr = {
+                "model_name": model,
+                "model_identifier": cfg_raw.get("model_identifier") or model,
+                "api_format": "openai",
+                "system_prompt": _default_ingest_prompt(),
+                "base_url": cfg_raw.get("base_url", ""),
+                "api_key": mem_resolve_token(auth.conn, cfg_raw.get("secret_ref")),
+                "max_tokens": 2048,
+                "generation_params": json.dumps(cfg_raw.get("generation_params") or {}),
+            }
+        else:
+            msg = (
+                f'No prompt configured for model "{model}" and no model config for '
+                f'namespace "{namespace}". Set one via POST /v1/model-prompts or POST /v1/memory/config.'
+            )
+            json_error("model_not_configured", msg, 422)
 
     # Known subjects / verbs from Postgres
     subj_rows = db_query(

@@ -172,12 +172,13 @@ def llm_complete_openai(cfg: dict, system: str, user: str) -> str:
         json_error("model_not_configured", "OpenAI base_url/api_key/model not configured.", 409)
 
     gen: dict[str, Any] = cfg.get("generation_params") if isinstance(cfg.get("generation_params"), dict) else {}
+    messages: list[dict[str, Any]] = []
+    if system:
+        messages.append({"role": "system", "content": system})
+    messages.append({"role": "user", "content": user})
     body: dict[str, Any] = {
         "model": model,
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
+        "messages": messages,
         **gen,
     }
 
@@ -218,9 +219,10 @@ def llm_complete_anthropic(cfg: dict, system: str, user: str) -> str:
     body: dict[str, Any] = {
         "model": model,
         "max_tokens": int(cfg.get("max_tokens", 2048)),
-        "system": system,
         "messages": [{"role": "user", "content": user}],
     }
+    if system:
+        body["system"] = system
     gen = cfg.get("generation_params")
     if isinstance(gen, dict):
         body.update(gen)
@@ -314,54 +316,23 @@ _DEFAULT_PROMPT = (
 )
 
 
-def mem_extract(chunk: str, cfg: dict) -> dict:
+def mem_extract(chunk: str, cfg: dict) -> list:
     """Extract SVPO candidate edges from a chunk via the configured LLM.
 
-    Returns the candidate_edges array.  Callers without creds should supply
-    pre-extracted edges instead of calling this.
+    Dispatches by ``cfg['api_format']`` (openai | anthropic) so the documents
+    path can use a connection borrowed from either model store.  Returns the
+    candidate_edges array.  Callers without creds should supply pre-extracted
+    edges instead of calling this.
     """
     tmpl = cfg.get("prompt_template") or _DEFAULT_PROMPT
     prompt = tmpl.replace("{{chunk}}", chunk).replace("{{text}}", chunk)
 
-    # Use llm_chat-style single-user-message completion for extraction
-    base = cfg.get("base_url", "")
-    token = cfg.get("token")
-    model = cfg.get("model_identifier", "")
-    if not base or token is None or not model:
-        json_error("model_not_configured", "No LLM model/token configured for this call.", 409)
+    # Single-user-message completion (no system prompt — the contract lives in the
+    # template).  llm_complete validates base_url/token/model and raises
+    # model_not_configured if the connection is incomplete.
+    content = llm_complete(cfg, "", prompt)
 
-    gen: dict[str, Any] = cfg.get("generation_params") if isinstance(cfg.get("generation_params"), dict) else {}
-    body: dict[str, Any] = {
-        "model": model,
-        "messages": [{"role": "user", "content": prompt}],
-        **gen,
-    }
-
-    timeout = int(os.environ.get("MALUDB_HTTP_TIMEOUT", "60"))
-    url = base.rstrip("/") + "/chat/completions"
-    try:
-        resp = httpx.post(
-            url,
-            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-            json=body,
-            timeout=httpx.Timeout(timeout, connect=10.0),
-        )
-    except httpx.HTTPError as exc:
-        json_error("upstream_error", f"Model HTTP call failed: {exc}", 502)
-
-    if resp.status_code >= 400:
-        json_error("upstream_error", f"Model endpoint returned HTTP {resp.status_code}.", 502)
-
-    data = resp.json()
-    content = None
-    try:
-        content = data["choices"][0]["message"]["content"]
-    except (KeyError, IndexError, TypeError):
-        pass
-    if not isinstance(content, str):
-        json_error("upstream_error", "LLM returned no content.", 502)
-
-    parsed = json.loads(content) if content else None
+    parsed = llm_json_from_text(content)
     if not isinstance(parsed, dict):
         json_error("upstream_error", "LLM output was not valid JSON.", 502)
 
