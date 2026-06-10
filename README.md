@@ -107,12 +107,27 @@ All configuration is via environment variables:
 - **PostgreSQL** for all tenant data via maludb_core facade views
 - **FastAPI dependency injection** for per-request auth + DB connections
 
+### Agent skills (maludb_core 0.97.0)
+
+`POST /v1/skills/ingest` registers a Claude Agent Skill bundle (SKILL.md +
+scripts/references/assets) as an immutable skill version: canonical bundle-hash
+dedupe, automatic parent detection, deterministic materiality screens (with an
+optional LLM judge for body-only changes), discovery-tag extraction via the
+configured model (`config/prompts/skill-extract.system.txt`; register it with
+`POST /v1/model-prompts`) or a deterministic frontmatter fallback, divergent
+fork lineage, and supersession of non-materially-different parents.
+`GET /v1/skills/{id}/bundle` returns the full bundle (base64 content, per-file
+hashes, executable bits) for client-side reconstruction; `GET /v1/skills`
+gains `subject`/`verb` tag search through `maludb_skill_search`. Content
+fields of a registered agent skill are immutable — PATCH answers 409.
+The `malu` CLI front-end is `malu skill push / push-all / list / pull`.
+
 See [CLAUDE.md](CLAUDE.md) for detailed architecture documentation.
 
 ## Testing
 
 ```bash
-pytest                             # full suite (243 tests)
+pytest                             # full suite (262 tests)
 pytest tests/test_subjects.py -v   # one file
 ruff check app/ tests/             # lint
 ```
