@@ -18,6 +18,7 @@ PHP, and Fastify servers):
   - extract.rich.system.txt    — full ingest-extraction contract, for capable models
   - extract.simple.system.txt  — condensed contract, for small/local models
   - skill-extract.system.txt   — skill discovery-tag extraction
+  - query-parse.system.txt     — note-search free-text query parse (verb + subject)
 Embedding rows ('embed' task) have no prompt.
 """
 
@@ -32,7 +33,7 @@ _PROMPT_DIR = config.PROJECT_ROOT / "config" / "prompts"
 
 # Tasks the servers run today.  The task column is a free string — new tasks
 # only need new seed rows and a pipeline that asks for them.
-TASKS = ("extract", "skill_extract", "embed")
+TASKS = ("extract", "skill_extract", "embed", "query_parse")
 
 # generation_params presets (stored as JSON strings, merged into the request).
 _GP_JSON = '{"temperature": 0.1, "response_format": {"type": "json_object"}}'
@@ -40,8 +41,9 @@ _GP_TEMP = '{"temperature": 0.1}'
 
 # Chat models: (provider, model_name, model_identifier, api_format, base_url,
 #               extract_prompt_file, max_tokens, generation_params)
-# Each gets two rows: task 'extract' (with its extract prompt) and task
-# 'skill_extract' (always skill-extract.system.txt).
+# Each gets three rows: task 'extract' (with its extract prompt), task
+# 'skill_extract' (always skill-extract.system.txt), and task 'query_parse'
+# (always query-parse.system.txt).
 # Base-URL convention follows app/helpers/llm.py: the openai format appends
 # /chat/completions (base ends in /v1), the anthropic format appends
 # /v1/messages (base is the bare host).
@@ -161,6 +163,19 @@ def seed_rows() -> list[dict]:
                 "task": "skill_extract",
                 "system_prompt": _prompt_text("skill-extract.system.txt"),
                 "max_tokens": max_tokens,
+                "generation_params": gen,
+            }
+        )
+        rows.append(
+            {
+                "provider": provider,
+                "model_name": name,
+                "model_identifier": ident,
+                "api_format": fmt,
+                "base_url": base,
+                "task": "query_parse",
+                "system_prompt": _prompt_text("query-parse.system.txt"),
+                "max_tokens": 256,
                 "generation_params": gen,
             }
         )
