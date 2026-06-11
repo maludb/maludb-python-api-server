@@ -59,8 +59,8 @@ class AuthContext:
 # FastAPI dependency (generator — cleans up the connection on exit)
 # ---------------------------------------------------------------------------
 
-async def require_auth(request: Request):  # noqa: ANN201 — generator dependency
-    """Extract and validate the Bearer token, resolve credentials, connect to Postgres.
+def authenticate_bearer(auth_header: str | None) -> AuthContext:
+    """Resolve an ``Authorization`` header value to an AuthContext.
 
     Mirrors PHP's require_auth():
       1. Extract ``Authorization: Bearer <token>``
@@ -69,11 +69,12 @@ async def require_auth(request: Request):  # noqa: ANN201 — generator dependen
       4. SQLite lookup via AuthStore.resolve_token
       5. TenantConnection.connect() with resolved creds
       6. Set tracer.user_id
-      7. Yield AuthContext
-      8. Close Postgres connection in finally block
+
+    Raises APIError(401) on any auth failure.  The caller owns the returned
+    context's Postgres connection and must close it when done.  Used by the
+    require_auth dependency and the MCP endpoint.
     """
     # 1. Extract Authorization header
-    auth_header = request.headers.get("authorization")
     if not auth_header:
         json_error("auth_missing", "Authorization: Bearer token required.", 401)
 
@@ -109,12 +110,17 @@ async def require_auth(request: Request):  # noqa: ANN201 — generator dependen
     tracer = get_tracer()
     tracer.user_id = row["user_id"]
 
-    # 7/8. Yield context, then close connection
+    return AuthContext(user_id=row["user_id"], role=row["role"], conn=conn)
+
+
+async def require_auth(request: Request):  # noqa: ANN201 — generator dependency
+    """FastAPI dependency: authenticate, yield the context, close the connection."""
+    ctx = authenticate_bearer(request.headers.get("authorization"))
     try:
-        yield AuthContext(user_id=row["user_id"], role=row["role"], conn=conn)
+        yield ctx
     finally:
         try:
-            conn.close()
+            ctx.conn.close()
         except Exception:
             pass
 

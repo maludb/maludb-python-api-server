@@ -53,13 +53,15 @@ app/
 ├── database.py          # PostgreSQL per-tenant connection + db_query/db_exec/db_one/db_tx_core
 ├── auth_store.py        # SQLite auth store (replaces MySQL)
 ├── auth.py              # FastAPI dependency: Bearer token → tenant DB creds
+├── llm_catalog.py       # Seeded default_prompts catalog (models × tasks)
 ├── errors.py            # APIError, exception-to-response mapping
 ├── sql_log.py           # SQL tracing (sql.log + ?debug=1 buffer)
 ├── helpers/
 │   ├── statements.py    # SVPO statement create/shape helpers
 │   ├── attributes.py    # Typed attribute create/shape/attach helpers
 │   ├── documents.py     # Document↔graph link/unlink helpers
-│   └── llm.py           # LLM chat/extract/embed, chunking
+│   ├── llm.py           # LLM chat/extract/embed, chunking
+│   └── llm_resolve.py   # Effective per-user task → model config resolution
 └── routers/
     ├── subjects.py      # /v1/subjects and sub-resources
     ├── verbs.py         # /v1/verbs and sub-resources
@@ -74,6 +76,8 @@ app/
     ├── objects.py       # /v1/objects/{kind} (atomic create)
     ├── graph.py         # /v1/edges, /v1/graph/neighbors, /v1/graph/walk
     ├── memory.py        # /v1/memory/* (LLM + vector pipeline)
+    ├── mcp.py           # POST /mcp — MCP server (stateless Streamable HTTP, 8 tools)
+    ├── llm_config.py    # /v1/llm/* (catalog, provider keys, task→model choices)
     ├── tokens.py        # /v1/tokens (self-service auth)
     ├── model_prompts.py # /v1/model-prompts
     └── types.py         # Type picker lists (subject/verb/document/episode types)

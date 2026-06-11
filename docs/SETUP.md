@@ -25,6 +25,7 @@ so you don't have to figure anything out as you go.
 10. [Verification checklist](#10-verification-checklist)
 11. [Troubleshooting](#11-troubleshooting)
 12. [Reference — endpoints & environment variables](#12-reference)
+13. [Connect an MCP client (Claude Code / Claude Desktop)](#13-connect-an-mcp-client)
 
 Throughout, **replace placeholders in `UPPER_CASE`** with your own values. The examples use the
 project defaults (`maludb` / `app` / `#change_on_install#`); substitute yours if different.
@@ -193,7 +194,35 @@ curl -s -X DELETE http://localhost:8000/v1/tokens/1 \
 
 ## 5. Register an LLM extractor model
 
-To turn free-text notes into graph data, register a model with its system prompt and API key.
+### The easy way: pick a seeded model (recommended)
+
+The server seeds a catalog of default prompts for common models on first start
+(`default_prompts` in `data/auth.db` — OpenAI, Anthropic, Google, xAI, DeepSeek, Ollama).
+With just your bearer token, store your provider key and pick a model per task:
+
+```bash
+# What's available (per task: extract, skill_extract, embed)
+curl -s http://localhost:8000/v1/llm/catalog -H "Authorization: Bearer $TOKEN" | jq .
+
+# Store your provider API key (never returned by the API afterwards)
+curl -s -X PUT http://localhost:8000/v1/llm/providers/openai \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"api_key":"sk-YOUR_OPENAI_KEY"}' | jq .
+
+# Choose your extraction model (and optionally an embed model)
+curl -s -X PUT http://localhost:8000/v1/llm/models/extract \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"model_name":"gpt-4o"}' | jq .
+```
+
+After that, `POST /v1/memory/ingest` without a `model` field uses your choice.
+Keys and choices are per `user_id` (all your tokens share them). The
+`maludb-terminal` CLI wraps these as `malu llm set-key` / `malu llm use`.
+
+### The legacy way: register a model + prompt by hand
+
+To register a fully custom model/prompt (or on older deployments), use
+`/v1/model-prompts` with its system prompt and API key.
 A ready-made GPT-4o extraction prompt ships in `config/prompts/chatgpt-4o.system.txt`.
 
 > **Auth note:** `/v1/model-prompts` is authorized by the **Postgres login in the body**, *not*
@@ -477,8 +506,11 @@ with `psql`, you must set it yourself:
 | `POST /v1/tokens` | PG login (body) | Mint a token |
 | `GET /v1/tokens` | PG login (body) | List token prefixes |
 | `DELETE /v1/tokens/{id}` | PG login (body) | Revoke a token |
-| `POST /v1/model-prompts` | PG login (body) | Register/update an LLM extractor |
-| `GET /v1/model-prompts` | PG login (body) | List configured models |
+| `POST /v1/model-prompts` | PG login (body) | Register/update an LLM extractor (legacy) |
+| `GET /v1/model-prompts` | PG login (body) | List configured models (legacy) |
+| `GET /v1/llm/catalog` | Bearer token | Seeded model catalog (models × tasks) |
+| `GET/PUT/DELETE /v1/llm/providers…` | Bearer token | Your LLM provider API keys |
+| `GET/PUT/DELETE /v1/llm/models…` | Bearer token | Your task → model choices |
 | `POST /v1/memory/ingest` | Bearer token | Text → LLM extraction → graph |
 | `POST /v1/memory/documents` | Bearer token | Upload/chunk/embed/ingest (or supply `edges`) |
 | `POST /v1/memory/search` | Bearer token | Embed query + vector search |
@@ -515,4 +547,45 @@ verifies by connecting. "Bearer token" = `Authorization: Bearer malu_…`.
 ```
 install project → §1 prerequisites → §2 env → §3 start → §4 token
    → §5 register model → §6 ingest → (§7 embeddings) → §8/§9 expose & service
+```
+
+---
+
+## 13. Connect an MCP client
+
+The server exposes a **Model Context Protocol** endpoint at `POST /mcp`
+(stateless Streamable HTTP, spec 2025-06-18) so agents can use MaluDB as
+long-term memory directly. It authenticates with the same Bearer tokens as the
+REST API (§4) — tools run as the token's user, so your per-user model choices
+(§5, `/v1/llm/*`) apply automatically.
+
+Register in Claude Code:
+
+```bash
+claude mcp add --transport http maludb http://localhost:8000/mcp \
+  --header "Authorization: Bearer $TOKEN"
+```
+
+**Tools** (read-only unless noted):
+- `store_memory` *(write)* — note → LLM extraction → knowledge graph
+- `search_memory` — semantic vector search (requires a subject/verb pre-filter;
+  the error suggests matching subjects when omitted)
+- `find_subjects` — list canonical entities (grounding for the other tools)
+- `explore_subject` — graph neighbors / multi-hop walk around one entity
+- `store_document` *(write)* — full document: chunk + extract + embed + ingest
+- `get_document` — document metadata + tags by id
+- `find_skills` / `get_skill` — discover stored agent skills; fetch metadata,
+  SKILL.md, and the file listing (full bundles stay on the REST API)
+
+`store_memory`/`store_document` need an extraction model (§5) and benefit from
+real embeddings (§7).
+
+Curl smoke test:
+
+```bash
+M="http://localhost:8000/mcp"; H1='Content-Type: application/json'; H2="Authorization: Bearer $TOKEN"
+curl -s $M -H "$H1" -H "$H2" -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"curl","version":"0"}}}' | jq .result.serverInfo
+curl -si $M -H "$H1" -H "$H2" -d '{"jsonrpc":"2.0","method":"notifications/initialized"}' | head -1   # HTTP 202
+curl -s $M -H "$H1" -H "$H2" -d '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' | jq '.result.tools | length'   # 8
+curl -s $M -H "$H1" -H "$H2" -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"find_subjects","arguments":{"limit":5}}}' | jq .
 ```

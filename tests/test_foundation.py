@@ -192,6 +192,27 @@ class TestAuthStore:
         finally:
             Path(db_path).unlink(missing_ok=True)
 
+    def test_init_db_seeds_default_prompts(self):
+        store, db_path = self._make_store()
+        try:
+            rows = store.list_default_prompts()
+            assert len(rows) > 0
+            names = {(r["model_name"], r["task"]) for r in rows}
+            assert ("gpt-4o", "extract") in names
+            assert ("claude-sonnet", "skill_extract") in names
+            assert ("text-embedding-3-small", "embed") in names
+        finally:
+            Path(db_path).unlink(missing_ok=True)
+
+    def test_init_db_seed_is_idempotent(self):
+        store, db_path = self._make_store()
+        try:
+            count_first = len(store.list_default_prompts())
+            store.init_db()  # second run must not duplicate or overwrite
+            assert len(store.list_default_prompts()) == count_first
+        finally:
+            Path(db_path).unlink(missing_ok=True)
+
 
 # ---------------------------------------------------------------------------
 # Health endpoint

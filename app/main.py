@@ -29,6 +29,8 @@ from app.routers import (
     documents,
     episodes,
     graph,
+    llm_config,
+    mcp,
     memory,
     model_prompts,
     notes,
@@ -58,6 +60,8 @@ app.include_router(attributes.router)
 app.include_router(documents.router)
 app.include_router(episodes.router)
 app.include_router(graph.router)
+app.include_router(llm_config.router)
+app.include_router(mcp.router)
 app.include_router(memory.router)
 app.include_router(model_prompts.router)
 app.include_router(notes.router)

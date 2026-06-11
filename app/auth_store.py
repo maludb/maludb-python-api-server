@@ -32,9 +32,13 @@ class AuthStore:
     # ------------------------------------------------------------------
 
     def init_db(self) -> None:
-        """Read and execute config/auth_store.sql to create tables if needed."""
+        """Read and execute config/auth_store.sql to create tables if needed,
+        then seed the default_prompts catalog (idempotent INSERT OR IGNORE)."""
+        from app.llm_catalog import seed_default_prompts
+
         schema = _SCHEMA_FILE.read_text()
         self._conn.executescript(schema)
+        seed_default_prompts(self._conn)
 
     # ------------------------------------------------------------------
     # Token resolution (called by require_auth)
@@ -83,6 +87,167 @@ class AuthStore:
         )
         row = cursor.fetchone()
         return dict(row) if row is not None else None
+
+    # ------------------------------------------------------------------
+    # Default-prompt catalog (seeded by app/llm_catalog.py)
+    # ------------------------------------------------------------------
+
+    def default_prompt(self, model_name: str, task: str) -> dict | None:
+        """Load the catalog row for (model_name, task), or None."""
+        cursor = self._conn.execute(
+            """
+            SELECT provider, model_name, model_identifier, api_format, base_url,
+                   task, system_prompt, max_tokens, generation_params
+              FROM default_prompts
+             WHERE model_name = ? AND task = ?
+             LIMIT 1
+            """,
+            (model_name, task),
+        )
+        row = cursor.fetchone()
+        return dict(row) if row is not None else None
+
+    def list_default_prompts(self) -> list[dict]:
+        """All catalog rows (without the prompt text — it can be large)."""
+        cursor = self._conn.execute(
+            """
+            SELECT provider, model_name, model_identifier, api_format, base_url,
+                   task, max_tokens,
+                   (system_prompt IS NOT NULL AND system_prompt <> '') AS has_system_prompt
+              FROM default_prompts
+             ORDER BY task, provider, model_name
+            """
+        )
+        return [dict(r) for r in cursor.fetchall()]
+
+    def catalog_providers(self) -> list[str]:
+        """Distinct providers present in the catalog."""
+        cursor = self._conn.execute("SELECT DISTINCT provider FROM default_prompts ORDER BY provider")
+        return [r["provider"] for r in cursor.fetchall()]
+
+    def catalog_tasks(self) -> list[str]:
+        """Distinct tasks present in the catalog."""
+        cursor = self._conn.execute("SELECT DISTINCT task FROM default_prompts ORDER BY task")
+        return [r["task"] for r in cursor.fetchall()]
+
+    # ------------------------------------------------------------------
+    # Per-user provider API keys
+    # ------------------------------------------------------------------
+
+    def user_provider_key(self, user_id: int, provider: str) -> dict | None:
+        """The user's key row for a provider (includes api_key — internal use only)."""
+        cursor = self._conn.execute(
+            "SELECT provider, api_key, base_url FROM user_provider_keys WHERE user_id = ? AND provider = ? LIMIT 1",
+            (user_id, provider),
+        )
+        row = cursor.fetchone()
+        return dict(row) if row is not None else None
+
+    def list_user_provider_keys(self, user_id: int) -> list[dict]:
+        """The user's providers — key value never selected, only key_set."""
+        cursor = self._conn.execute(
+            """
+            SELECT provider,
+                   (api_key IS NOT NULL AND api_key <> '') AS key_set,
+                   base_url, updated_at
+              FROM user_provider_keys
+             WHERE user_id = ?
+             ORDER BY provider
+            """,
+            (user_id,),
+        )
+        rows = [dict(r) for r in cursor.fetchall()]
+        for r in rows:
+            r["key_set"] = bool(r["key_set"])
+        return rows
+
+    def upsert_user_provider_key(
+        self, user_id: int, provider: str, api_key: str | None, base_url: str | None
+    ) -> None:
+        """Insert or update a provider key.  A None api_key on update preserves
+        the stored key (same convention as /v1/model-prompts)."""
+        if api_key is None:
+            existing = self.user_provider_key(user_id, provider)
+            api_key = (existing or {}).get("api_key")
+        self._conn.execute(
+            """
+            INSERT INTO user_provider_keys (user_id, provider, api_key, base_url)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(user_id, provider) DO UPDATE SET
+                api_key    = excluded.api_key,
+                base_url   = excluded.base_url,
+                updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+            """,
+            (user_id, provider, api_key, base_url),
+        )
+        self._conn.commit()
+
+    def delete_user_provider_key(self, user_id: int, provider: str) -> bool:
+        """Delete a provider key; returns True if a row was removed."""
+        cur = self._conn.execute(
+            "DELETE FROM user_provider_keys WHERE user_id = ? AND provider = ?",
+            (user_id, provider),
+        )
+        self._conn.commit()
+        return cur.rowcount > 0
+
+    # ------------------------------------------------------------------
+    # Per-user task -> model choices
+    # ------------------------------------------------------------------
+
+    def user_model_choice(self, user_id: int, task: str) -> dict | None:
+        """The user's model choice for a task, or None."""
+        cursor = self._conn.execute(
+            "SELECT task, model_name, system_prompt FROM user_model_choices"
+            " WHERE user_id = ? AND task = ? LIMIT 1",
+            (user_id, task),
+        )
+        row = cursor.fetchone()
+        return dict(row) if row is not None else None
+
+    def list_user_model_choices(self, user_id: int) -> list[dict]:
+        """All of the user's task -> model choices."""
+        cursor = self._conn.execute(
+            """
+            SELECT task, model_name,
+                   (system_prompt IS NOT NULL AND system_prompt <> '') AS system_prompt_override,
+                   updated_at
+              FROM user_model_choices
+             WHERE user_id = ?
+             ORDER BY task
+            """,
+            (user_id,),
+        )
+        rows = [dict(r) for r in cursor.fetchall()]
+        for r in rows:
+            r["system_prompt_override"] = bool(r["system_prompt_override"])
+        return rows
+
+    def upsert_user_model_choice(
+        self, user_id: int, task: str, model_name: str, system_prompt: str | None
+    ) -> None:
+        """Insert or replace the user's model choice for a task."""
+        self._conn.execute(
+            """
+            INSERT INTO user_model_choices (user_id, task, model_name, system_prompt)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(user_id, task) DO UPDATE SET
+                model_name    = excluded.model_name,
+                system_prompt = excluded.system_prompt,
+                updated_at    = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+            """,
+            (user_id, task, model_name, system_prompt),
+        )
+        self._conn.commit()
+
+    def delete_user_model_choice(self, user_id: int, task: str) -> bool:
+        """Delete the user's model choice for a task; True if a row was removed."""
+        cur = self._conn.execute(
+            "DELETE FROM user_model_choices WHERE user_id = ? AND task = ?",
+            (user_id, task),
+        )
+        self._conn.commit()
+        return cur.rowcount > 0
 
     # ------------------------------------------------------------------
     # Raw connection (for testing / admin endpoints)
