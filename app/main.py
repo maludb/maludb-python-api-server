@@ -32,6 +32,7 @@ from app.routers import (
     llm_config,
     mcp,
     memory,
+    memory_notes,
     model_prompts,
     notes,
     objects,
@@ -63,6 +64,7 @@ app.include_router(graph.router)
 app.include_router(llm_config.router)
 app.include_router(mcp.router)
 app.include_router(memory.router)
+app.include_router(memory_notes.router)
 app.include_router(model_prompts.router)
 app.include_router(notes.router)
 app.include_router(objects.router)

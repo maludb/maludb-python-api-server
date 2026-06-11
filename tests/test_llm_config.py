@@ -98,7 +98,7 @@ class TestCatalog:
         resp = client.get("/v1/llm/catalog", headers=_HEADERS)
         assert resp.status_code == 200
         data = resp.json()
-        assert set(data["tasks"]) == {"embed", "extract", "skill_extract"}
+        assert set(data["tasks"]) == {"embed", "extract", "skill_extract", "query_parse"}
         by_key = {(m["model_name"], m["task"]): m for m in data["models"]}
         assert ("gpt-4o", "extract") in by_key
         assert ("claude-sonnet", "extract") in by_key

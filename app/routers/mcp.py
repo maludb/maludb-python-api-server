@@ -18,9 +18,10 @@ Implements MCP spec 2025-06-18 in its simplest conformant shape:
     {"error":{code,message}} JSON in the text block, so agents can read the
     error code and self-correct.  Protocol failures use JSON-RPC error codes.
 
-Eight tools: store_memory, search_memory, find_subjects, explore_subject,
-store_document, get_document, find_skills, get_skill.  The pipeline tools call
-the shared cores in app/routers/memory.py; the read tools carry their own
+Nine tools: store_memory, search_memory, find_subjects, explore_subject,
+store_document, get_document, find_notes, find_skills, get_skill.  The
+pipeline tools call the shared cores in app/routers/memory.py and
+app/routers/memory_notes.py; the read tools carry their own
 literal SQL (copied from the corresponding REST routers — see the repo's
 SQL-traceability principle).  The TOOLS registry below is a cross-server
 contract: the Fastify and PHP servers port it byte-for-byte.
@@ -40,6 +41,7 @@ from app.auth import authenticate_bearer
 from app.database import db_one, db_query, db_tx_core
 from app.errors import APIError, _pg_error_message, classify_database_error
 from app.routers.memory import documents_core, ingest_core, search_core
+from app.routers.memory_notes import notes_search_core
 
 router = APIRouter()
 
@@ -47,7 +49,7 @@ router = APIRouter()
 # Protocol constants
 # ---------------------------------------------------------------------------
 
-SERVER_VERSION = "0.1.0"
+SERVER_VERSION = "0.2.0"
 PROTOCOL_VERSIONS = {"2025-03-26", "2025-06-18"}
 DEFAULT_PROTOCOL_VERSION = "2025-06-18"
 SERVER_INFO = {"name": "maludb", "title": "MaluDB Memory", "version": SERVER_VERSION}
@@ -193,6 +195,30 @@ TOOLS: list[dict] = [
                 "document_id": {"type": "integer"},
             },
             "required": ["document_id"],
+            "additionalProperties": False,
+        },
+        "annotations": _READ_ONLY,
+    },
+    {
+        "name": "find_notes",
+        "title": "Find notes",
+        "description": (
+            "Retrieve stored notes by the subjects/verbs of their extracted edges."
+            " Pass query for free text ('Install Ubuntu' — the server parses out the"
+            " verb and subject), or subject_like patterns plus verb_like (fuzzy:"
+            " 'installation' finds 'install') or action (exact verb). Set"
+            " all_sources=true to widen beyond notes to every stored document."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "subject_like": {"type": "array", "items": {"type": "string"}},
+                "verb_like": {"type": "string"},
+                "action": {"type": "string"},
+                "all_sources": {"type": "boolean", "default": False},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 200, "default": 20},
+            },
             "additionalProperties": False,
         },
         "annotations": _READ_ONLY,
@@ -582,6 +608,29 @@ def _tool_get_document(auth, args: dict) -> dict:
     return _text_result({"document": doc})
 
 
+def _tool_find_notes(auth, args: dict) -> dict:
+    query = str(args["query"]).strip() if args.get("query") and str(args["query"]).strip() else None
+    subject_like = [str(s) for s in args.get("subject_like") or [] if str(s).strip()] or None
+    verb_like = str(args["verb_like"]).strip() if args.get("verb_like") and str(args["verb_like"]).strip() else None
+    action = str(args["action"]).strip() if args.get("action") and str(args["action"]).strip() else None
+    all_sources = bool(args.get("all_sources"))
+    limit = max(1, min(200, _int_arg(args, "limit", 20)))
+
+    if not query and not subject_like and not verb_like and not action:
+        raise _InvalidParams("At least one of query, subject_like, verb_like, action is required.")
+
+    payload = notes_search_core(
+        auth,
+        q=query,
+        subject_like=subject_like,
+        verb_like=verb_like,
+        action=action,
+        all_sources=all_sources,
+        limit=limit,
+    )
+    return _text_result(payload)
+
+
 def _tool_find_skills(auth, args: dict) -> dict:
     q = str(args["query"]).strip() if args.get("query") and str(args["query"]).strip() else None
     subject = str(args["subject"]).strip() if args.get("subject") and str(args["subject"]).strip() else None
@@ -687,6 +736,7 @@ _TOOL_HANDLERS = {
     "explore_subject": _tool_explore_subject,
     "store_document": _tool_store_document,
     "get_document": _tool_get_document,
+    "find_notes": _tool_find_notes,
     "find_skills": _tool_find_skills,
     "get_skill": _tool_get_skill,
 }
