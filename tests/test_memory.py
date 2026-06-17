@@ -27,6 +27,7 @@ _AUTH_PATHS = [
     ("POST", "/v1/memory/documents"),
     ("POST", "/v1/memory/search"),
     ("POST", "/v1/memory/ingest"),
+    ("POST", "/v1/memory/reindex/run"),
 ]
 
 
@@ -36,9 +37,7 @@ class TestMemoryRouterRegistered:
     @pytest.mark.parametrize("method,path", _AUTH_PATHS)
     def test_missing_auth_returns_401(self, method: str, path: str):
         response = client.request(method, path)
-        assert response.status_code == 401, (
-            f"{method} {path} returned {response.status_code}, expected 401"
-        )
+        assert response.status_code == 401, f"{method} {path} returned {response.status_code}, expected 401"
         data = response.json()
         assert "error" in data
         assert data["error"]["code"] == "auth_missing"

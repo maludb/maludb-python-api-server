@@ -21,7 +21,7 @@ import json
 import os
 from typing import Any
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Query, Request
 from fastapi.responses import JSONResponse
 
 from app import config
@@ -404,9 +404,15 @@ def documents_core(
                         p_verbs => %s::text[], p_events => %s::text[],
                         p_metadata_jsonb => %s::jsonb) AS id""",
             [
-                title, text, source_type, media_type, doc_type,
-                _pg_text_array(projects), _pg_text_array(subjects),
-                _pg_text_array(verbs), _pg_text_array(events),
+                title,
+                text,
+                source_type,
+                media_type,
+                doc_type,
+                _pg_text_array(projects),
+                _pg_text_array(subjects),
+                _pg_text_array(verbs),
+                _pg_text_array(events),
                 metadata,
             ],
         )
@@ -441,18 +447,30 @@ def documents_core(
                             p_namespace        => %s,
                             p_document_id      => %s) AS statement_id""",
                 [
-                    document_id, subject_text, verb_text, predicate, e["__vector"],
-                    embedding_model, subject_ty, str(e["source_span"]), confidence,
-                    provenance, extr_model, namespace, document_id,
+                    document_id,
+                    subject_text,
+                    verb_text,
+                    predicate,
+                    e["__vector"],
+                    embedding_model,
+                    subject_ty,
+                    str(e["source_span"]),
+                    confidence,
+                    provenance,
+                    extr_model,
+                    namespace,
+                    document_id,
                 ],
             )
-            out.append({
-                "statement_id": int(st["statement_id"]),
-                "subject_text": subject_text,
-                "verb_text": verb_text,
-                "subject_type": subject_ty,
-                "provenance": provenance,
-            })
+            out.append(
+                {
+                    "statement_id": int(st["statement_id"]),
+                    "subject_text": subject_text,
+                    "verb_text": verb_text,
+                    "subject_type": subject_ty,
+                    "provenance": provenance,
+                }
+            )
         return {"document_id": document_id, "edges": out}
 
     result = db_tx_core(auth.conn, _ingest)
@@ -782,4 +800,152 @@ def ingest_core(
         "api_format": pr.get("api_format", "openai"),
         "namespace": namespace,
         "result": result["result"],
+    }
+
+
+# ===========================================================================
+# POST /v1/memory/reindex/run — background document/note reindex (one batch)
+# ===========================================================================
+
+
+def _memory_reindex_extract(auth, text: str) -> tuple[dict | None, str | None]:
+    """Re-derive a document's/note's SVPOR extraction from its stored text.
+
+    Returns (extraction, model), or (None, None) when no 'extract' model + key
+    is configured for the tenant -- reindex requires a model (there is no
+    deterministic SVPOR fallback the way skills have a frontmatter fallback).
+    Mirrors ingest_core's extraction (same `extract` task prompt, live type
+    catalog + known subjects/verbs); kept as a focused helper so the critical
+    ingest path stays untouched.
+    """
+    store = get_auth_store()
+    pr = resolve_task_config(store, auth.user_id, "extract", None)
+    if pr is None or not pr.get("api_key"):
+        return None, None
+    model = pr.get("model_name")
+
+    subj_rows = db_query(
+        auth.conn,
+        "SELECT canonical_name AS name, subject_type AS type FROM maludb_subject ORDER BY canonical_name",
+    )
+    verb_rows = db_query(auth.conn, "SELECT canonical_name FROM maludb_verb ORDER BY canonical_name")
+    known_subjects_json = json.dumps([{"name": r["name"], "type": r["type"]} for r in subj_rows], ensure_ascii=False)
+    known_verbs_json = json.dumps([r["canonical_name"] for r in verb_rows], ensure_ascii=False)
+
+    try:
+        type_rows = db_query(
+            auth.conn,
+            "SELECT category, subject_type, description FROM maludb_subject_type ORDER BY category, sort_order",
+        )
+    except Exception:
+        type_rows = db_query(
+            auth.conn,
+            "SELECT category, subject_type, description"
+            " FROM maludb_core.malu$svpor_subject_type ORDER BY category, sort_order",
+        )
+    entity_lines: list[str] = []
+    event_lines: list[str] = []
+    for r in type_rows:
+        desc = " — " + r["description"] if r.get("description") and str(r["description"]).strip() else ""
+        line = f"  - {r['subject_type']}{desc}"
+        (event_lines if (r.get("category") or "entity") == "event" else entity_lines).append(line)
+    entity_block = "\n".join(entity_lines) if entity_lines else "  - other"
+    event_block = "\n".join(event_lines) if event_lines else "  - task"
+
+    system = (
+        str(pr.get("system_prompt", ""))
+        .replace("{{ENTITY_TYPES}}", entity_block)
+        .replace("{{EVENT_KINDS}}", event_block)
+    )
+    user_msg = (
+        f"TEXT:\n{text}\n\nHINTS:\n[]\n\nKNOWN_SUBJECTS:\n{known_subjects_json}\n\nKNOWN_VERBS:\n{known_verbs_json}\n"
+    )
+    llm_cfg: dict[str, Any] = {
+        "api_format": pr.get("api_format", "openai"),
+        "base_url": pr.get("base_url", ""),
+        "model_identifier": pr.get("model_identifier") or model,
+        "token": pr["api_key"],
+        "max_tokens": int(pr.get("max_tokens", 2048)),
+        "generation_params": json.loads(pr["generation_params"]) if pr.get("generation_params") else {},
+    }
+    extraction = llm_json_from_text(llm_complete(llm_cfg, system, user_msg))
+    return extraction, model
+
+
+@router.post("/v1/memory/reindex/run")
+def memory_reindex_run(
+    auth: Auth,
+    limit: int = Query(default=32, le=200),
+    max_age: str | None = Query(default="30 days", max_length=64),
+    source_type: str | None = Query(default=None, max_length=64),
+):
+    """Run one document/note reindex sweep batch for the calling tenant (maludb_core 0.100.0).
+
+    The cron-driven half of the document/note reindex (DB contract: maludb_core
+    docs/document-reindex.md). Claims the stalest documents/notes via
+    maludb_memory_reindex_claim, re-derives their SVPOR footprint against the
+    current graph with the user's `extract` model, and applies a
+    replace-footprint rewrite via maludb_memory_reindex_apply. Intended to be
+    invoked on a schedule by an external cron / systemd timer. A document whose
+    extraction fails is captured in `errors`; one with no configured model is
+    listed in `skipped`; neither aborts the batch.
+    """
+    has_claim = db_one(
+        auth.conn,
+        "SELECT EXISTS(SELECT 1 FROM pg_proc WHERE proname = 'maludb_memory_reindex_claim') AS ok",
+    )
+    if not has_claim or not has_claim["ok"]:
+        json_error(
+            "reindex_unavailable",
+            "maludb_memory_reindex_claim is not available (requires maludb_core 0.100.0;"
+            " re-run enable_memory_schema('<tenant>') after upgrading).",
+            501,
+        )
+
+    age = (max_age or "").strip() or None
+    src = [source_type.strip()] if source_type and source_type.strip() else None
+    rows = db_query(
+        auth.conn,
+        "SELECT document_id, source_type, title, content_text  FROM maludb_memory_reindex_claim(%s, %s::interval, %s)",
+        [limit, age, src],
+    )
+
+    reindexed: list[dict] = []
+    skipped: list[dict] = []
+    errors: list[dict] = []
+    for r in rows:
+        did = int(r["document_id"])
+        text = r["content_text"] or ""
+        if not text.strip():
+            skipped.append({"document_id": did, "reason": "empty content_text"})
+            continue
+        try:
+            extraction, model = _memory_reindex_extract(auth, text)
+            if extraction is None:
+                skipped.append({"document_id": did, "reason": "no extract model configured"})
+                continue
+
+            def _apply(conn, _d=did, _e=extraction, _m=model):  # noqa: ANN001, ANN202
+                return db_one(
+                    conn,
+                    "SELECT maludb_memory_reindex_apply("
+                    "  p_document_id => %s, p_extraction => %s::jsonb, p_model => %s) AS result",
+                    [_d, json.dumps(_e), _m],
+                )
+
+            applied = db_tx_core(auth.conn, _apply)["result"]
+            if isinstance(applied, str):
+                applied = json.loads(applied)
+            reindexed.append({"document_id": did, "title": r["title"], "model": model, "applied": applied})
+        except Exception as exc:  # one document's failure must not abort the sweep
+            errors.append({"document_id": did, "error": str(exc)})
+
+    return {
+        "claimed": len(rows),
+        "reindexed": reindexed,
+        "skipped": skipped,
+        "errors": errors,
+        "limit": limit,
+        "max_age": age,
+        "source_type": source_type,
     }
