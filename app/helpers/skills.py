@@ -36,6 +36,7 @@ _MATERIAL_FRONTMATTER_KEYS = (
 # Canonical bundle hash
 # ---------------------------------------------------------------------------
 
+
 def file_sha256(content: bytes) -> str:
     return hashlib.sha256(content).hexdigest()
 
@@ -55,6 +56,7 @@ def bundle_hash(files: list[dict[str, Any]]) -> str:
 # ---------------------------------------------------------------------------
 # Materiality screens
 # ---------------------------------------------------------------------------
+
 
 def _normalize_ws(text: str) -> str:
     return re.sub(r"\s+", " ", text or "").strip()
@@ -94,14 +96,10 @@ def materiality_screens(
             reasons.append(f"frontmatter:{key}")
 
     old_files = {
-        f["relative_path"]: f["file_hash"]
-        for f in (parent.get("files") or [])
-        if f.get("relative_path") != "SKILL.md"
+        f["relative_path"]: f["file_hash"] for f in (parent.get("files") or []) if f.get("relative_path") != "SKILL.md"
     }
     new_files_map = {
-        f["relative_path"]: f["file_hash"]
-        for f in (new_files or [])
-        if f.get("relative_path") != "SKILL.md"
+        f["relative_path"]: f["file_hash"] for f in (new_files or []) if f.get("relative_path") != "SKILL.md"
     }
     for path in sorted(set(old_files) | set(new_files_map)):
         if old_files.get(path) != new_files_map.get(path):
@@ -155,6 +153,7 @@ def deterministic_discovery(name: str, frontmatter: dict[str, Any]) -> dict[str,
 # Skill extraction JSON post-processing
 # ---------------------------------------------------------------------------
 
+
 def coerce_skill_extraction(
     extraction: dict[str, Any],
     name: str,
@@ -186,7 +185,69 @@ def coerce_skill_extraction(
             break
     if skill_key is None:
         skill_key = "skill_self"
-        subjects.insert(0, {"key": skill_key, "name": name, "type": "skill",
-                            "description": str((frontmatter or {}).get("description") or "") or None})
+        subjects.insert(
+            0,
+            {
+                "key": skill_key,
+                "name": name,
+                "type": "skill",
+                "description": str((frontmatter or {}).get("description") or "") or None,
+            },
+        )
     out["subjects"] = subjects
     return out
+
+
+# ---------------------------------------------------------------------------
+# Reindex apply params
+# ---------------------------------------------------------------------------
+
+
+def build_reindex_params(
+    extraction: dict[str, Any],
+    subject_id_map: dict[str, int],
+) -> dict[str, Any]:
+    """Shape a (re-)extraction into the args maludb_skill_reindex_apply wants.
+
+    Produces deduped, trimmed {subjects, verbs, keywords} from an extraction
+    dict (the same shape coerce_skill_extraction yields).  ``subject_id_map``
+    maps ``lower(name) -> subject_id`` for names that already exist in the
+    tenant's registry; a matched subject carries its graph id so the rewritten
+    tag keeps its FK link (find_skill matches on name regardless, but the id
+    preserves the graph edge a name-only rewrite would drop).  Dedup is
+    case-insensitive and first-wins, so the id-bearing form is kept.
+    """
+    subjects: list[dict[str, Any]] = []
+    seen_subj: set[str] = set()
+    for s in extraction.get("subjects") or []:
+        if not isinstance(s, dict):
+            continue
+        name = str(s.get("name") or "").strip()
+        if not name or name.lower() in seen_subj:
+            continue
+        seen_subj.add(name.lower())
+        entry: dict[str, Any] = {"name": name}
+        sid = subject_id_map.get(name.lower())
+        if sid is not None:
+            entry["id"] = sid
+        subjects.append(entry)
+
+    verbs: list[dict[str, Any]] = []
+    seen_verb: set[str] = set()
+    for v in extraction.get("verbs") or []:
+        if not isinstance(v, dict):
+            continue
+        name = str(v.get("name") or "").strip()
+        if name and name.lower() not in seen_verb:
+            seen_verb.add(name.lower())
+            verbs.append({"name": name})
+
+    keywords: list[str] = []
+    seen_kw: set[str] = set()
+    for k in extraction.get("keywords") or []:
+        kw = str(k).strip()
+        if kw and kw.lower() not in seen_kw:
+            seen_kw.add(kw.lower())
+            keywords.append(kw)
+
+    return {"subjects": subjects, "verbs": verbs, "keywords": keywords}

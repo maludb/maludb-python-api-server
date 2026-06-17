@@ -24,10 +24,12 @@ _AUTH_PATHS = [
     ("GET", "/v1/skills"),
     ("POST", "/v1/skills"),
     ("GET", "/v1/skills/1"),
+    ("GET", "/v1/skills/1/discovery"),
     ("PATCH", "/v1/skills/1"),
     ("DELETE", "/v1/skills/1"),
     ("POST", "/v1/skills/1/duplicate"),
     ("POST", "/v1/skills/ingest"),
+    ("POST", "/v1/skills/reindex/run"),
     ("GET", "/v1/skills/1/bundle"),
 ]
 
@@ -38,9 +40,7 @@ class TestSkillsRouterRegistered:
     @pytest.mark.parametrize("method,path", _AUTH_PATHS)
     def test_missing_auth_returns_401(self, method: str, path: str):
         response = client.request(method, path)
-        assert response.status_code == 401, (
-            f"{method} {path} returned {response.status_code}, expected 401"
-        )
+        assert response.status_code == 401, f"{method} {path} returned {response.status_code}, expected 401"
         data = response.json()
         assert "error" in data
         assert data["error"]["code"] == "auth_missing"

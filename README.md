@@ -141,6 +141,27 @@ fields (the `maludb` CLI sends `source_type: "note"`); notes ingested
 before that default to `source_type='document'` and only surface with
 `all_sources=true`. The CLI front-end is `maludb get note`.
 
+### Skill reindex (maludb_core 0.99.0)
+
+`POST /v1/skills/reindex/run` runs one background reindex sweep for the
+calling tenant: it claims the stalest skills via `maludb_skill_reindex_claim`
+(never indexed, older than `?max_age=` — default `30 days`, or older than the
+registry watermark), re-derives their discovery tags against the *current*
+knowledge graph (the user's `skill_extract` model, or the deterministic
+fallback), and applies a replace-`extracted` rewrite via
+`maludb_skill_reindex_apply` — curator `manual` tags are preserved by the DB.
+`?limit=` (default 32) caps the batch; one skill's failure is reported in
+`errors` without aborting the sweep. Returns `501` until the 0.99.0 facades
+are enabled (`enable_memory_schema`). This re-derivation is what links a skill
+to subjects/verbs minted *after* it was first loaded, and what repairs a weak
+initial extraction (find_skill's `+100`/`+80` facets).
+
+Drive it on a schedule with the bundled systemd timer (the "background agent"):
+`deploy/maludb-skill-reindex.{service,timer}` POST the endpoint periodically —
+see the unit header for install. The sweep reindexes the configured token's
+tenant; run one timer per tenant token for more. (DB-side protocol:
+maludb_core `docs/skill-reindex.md`.)
+
 See [CLAUDE.md](CLAUDE.md) for detailed architecture documentation.
 
 ## Testing

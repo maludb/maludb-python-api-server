@@ -18,6 +18,12 @@ deterministic frontmatter-only fallback), divergent fork lineage, and
 supersession when a revision is not materially different from its parent.
 Registered agent skills (bundle_hash set) are content-immutable: PATCH
 rejects content fields with 409; lifecycle fields stay editable.
+
+Retrieval mirrors the DB's two entry points:
+    GET /v1/skills?q=…&subject=…&verb=…  -> maludb_skill_search/find_skill,
+        ranked with score + match_reasons (subject/verb/keyword/text hits).
+    GET /v1/skills/{id}/discovery        -> maludb_skill_get/get_skill, the
+        full graph-tag payload (keywords, subjects, verbs, states, access).
 """
 
 from __future__ import annotations
@@ -35,6 +41,7 @@ from app.errors import json_error
 from app.helpers.llm import llm_complete, llm_json_from_text
 from app.helpers.llm_resolve import resolve_task_config
 from app.helpers.skills import (
+    build_reindex_params,
     bundle_hash,
     coerce_skill_extraction,
     deterministic_discovery,
@@ -90,10 +97,14 @@ def list_skills(
     limit: int = Query(default=50, le=200),
 ):
     # Tag-aware discovery: subject/verb hit the skill_subject/skill_verb tag
-    # tables (and q the keyword/tsquery rails) through maludb_skill_search,
-    # which also folds in visible public skills, scoring, and lineage.
-    # The plain list (no subject/verb) keeps the original ILIKE semantics.
-    if subject or verb:
+    # tables, and a plain `q` rides the keyword(+40)/full-text(+10) rails of
+    # find_skill via maludb_skill_search, which also folds in visible public
+    # skills, scoring, match_reasons, and lineage. Routing q through search
+    # (not ILIKE) is what surfaces keyword-tag hits a name/description LIKE
+    # would miss. The `visibility` filter is a browse concern the search
+    # function doesn't take, so a visibility-filtered `q` stays on the ILIKE
+    # list; the no-arg list keeps the original ILIKE semantics too.
+    if subject or verb or (q and not visibility):
         rows = db_query(
             auth.conn,
             """SELECT owner_schema, skill_id AS id, skill_name AS name, description,
@@ -167,8 +178,8 @@ async def create_skill(auth: Auth, request: Request):
 
     created = db_one(
         auth.conn,
-        f"""INSERT INTO maludb_skill ({', '.join(cols)})
-           VALUES ({', '.join(placeholders)})
+        f"""INSERT INTO maludb_skill ({", ".join(cols)})
+           VALUES ({", ".join(placeholders)})
            RETURNING skill_id AS id, skill_name AS name, description, markdown, version,
                      visibility, packaging_kind, enabled, created_at""",
         params,
@@ -190,6 +201,47 @@ def get_skill(skill_id: int, auth: Auth):
     if skill is None:
         json_error("not_found", "Skill not found.", 404)
     return {"skill": skill}
+
+
+# ===========================================================================
+# GET /v1/skills/{id}/discovery — full graph-tag payload (get_skill facade)
+# ===========================================================================
+
+
+@router.get("/v1/skills/{skill_id}/discovery")
+def get_skill_discovery(skill_id: int, auth: Auth):
+    """Full discovery payload via the maludb_skill_get / get_skill facade.
+
+    Returns exactly the graph-tag view that find_skill scores against: the
+    skill row plus its keywords, subject tags, verb tags, state machine, and
+    access policy. This is how a caller confirms a saved skill is actually in
+    the knowledge graph (subjects/verbs attached, +100/+80 facets live) rather
+    than discoverable by full-text alone. The facade applies the same
+    visibility gate as find_skill, so a not-visible skill reads as 404.
+    """
+    # The owner schema scopes the lookup; a tenant's own rows carry it, and
+    # legacy rows (NULL) resolve to current_schema().
+    src = db_one(
+        auth.conn,
+        "SELECT COALESCE(owner_schema, current_schema()) AS owner_schema  FROM maludb_skill WHERE skill_id = %s",
+        [skill_id],
+    )
+    if src is None:
+        json_error("not_found", "Skill not found.", 404)
+
+    row = db_one(
+        auth.conn,
+        "SELECT payload FROM maludb_skill_get(%s, %s)",
+        [src["owner_schema"], skill_id],
+    )
+    # get_skill emits no row when the skill isn't visible to this tenant.
+    if row is None or row.get("payload") is None:
+        json_error("not_found", "Skill not found or not visible.", 404)
+
+    payload = row["payload"]
+    if isinstance(payload, str):
+        payload = json.loads(payload)
+    return {"discovery": payload}
 
 
 # ===========================================================================
@@ -290,9 +342,7 @@ async def duplicate_skill(skill_id: int, auth: Auth, request: Request):
         json_error("not_found", "Skill not found.", 404)
 
     body = await request.json()
-    new_name = (
-        str(body["name"]) if "name" in body and body["name"] is not None and str(body["name"]).strip() else None
-    )
+    new_name = str(body["name"]) if "name" in body and body["name"] is not None and str(body["name"]).strip() else None
     new_version = (
         str(body["version"])
         if "version" in body and body["version"] is not None and str(body["version"]).strip()
@@ -542,9 +592,14 @@ async def ingest_skill(auth: Auth, request: Request):
         if isinstance(parent_files, str):
             parent_files = json.loads(parent_files)
         materiality = materiality_screens(
-            {"markdown": parent_row["markdown"], "frontmatter_jsonb": parent_row["frontmatter_jsonb"],
-             "files": parent_files},
-            markdown, frontmatter, files,
+            {
+                "markdown": parent_row["markdown"],
+                "frontmatter_jsonb": parent_row["frontmatter_jsonb"],
+                "files": parent_files,
+            },
+            markdown,
+            frontmatter,
+            files,
         )
         if isinstance(body.get("materially_different"), bool):
             materially_different = body["materially_different"]
@@ -556,8 +611,7 @@ async def ingest_skill(auth: Auth, request: Request):
         else:  # gray zone
             pr_judge = resolve_task_config(get_auth_store(), auth.user_id, "skill_extract", model)
             if pr_judge and pr_judge.get("api_key"):
-                materially_different = _judge_materiality(
-                    pr_judge, parent_row["markdown"] or "", markdown, name)
+                materially_different = _judge_materiality(pr_judge, parent_row["markdown"] or "", markdown, name)
                 materiality["reasons"].append("llm_judged")
             else:
                 materially_different = True
@@ -623,7 +677,9 @@ async def ingest_skill(auth: Auth, request: Request):
         discovery = deterministic_discovery(name, frontmatter)
         extraction = coerce_skill_extraction(
             {"subjects": [], "verbs": [], "edges": [], "keywords": discovery["keywords"]},
-            name, markdown, frontmatter,
+            name,
+            markdown,
+            frontmatter,
         )
         if preview:
             return {
@@ -634,9 +690,14 @@ async def ingest_skill(auth: Auth, request: Request):
                 "parent": {"owner_schema": parent_schema, "skill_id": parent_id, "note": parent_note},
             }
 
-    version = str(body["version"]).strip() if body.get("version") else (
-        str((frontmatter.get("metadata") or {}).get("version") or "").strip() or None
-        if isinstance(frontmatter.get("metadata"), dict) else None
+    version = (
+        str(body["version"]).strip()
+        if body.get("version")
+        else (
+            str((frontmatter.get("metadata") or {}).get("version") or "").strip() or None
+            if isinstance(frontmatter.get("metadata"), dict)
+            else None
+        )
     )
     description = str(frontmatter.get("description") or "").strip() or None
 
@@ -704,11 +765,19 @@ async def ingest_skill(auth: Auth, request: Request):
                         p_files => %s::jsonb, p_parent_owner_schema => %s,
                         p_parent_skill_id => %s, p_materially_different => %s) AS result""",
             [
-                name, markdown, computed_hash,
-                description, json.dumps(frontmatter), version,
-                keywords or None, json.dumps(subjects_param), json.dumps(verbs_param),
-                json.dumps(files_param), parent_schema,
-                parent_id, materially_different,
+                name,
+                markdown,
+                computed_hash,
+                description,
+                json.dumps(frontmatter),
+                version,
+                keywords or None,
+                json.dumps(subjects_param),
+                json.dumps(verbs_param),
+                json.dumps(files_param),
+                parent_schema,
+                parent_id,
+                materially_different,
             ],
         )
         register = reg_row["result"]
@@ -732,6 +801,158 @@ async def ingest_skill(auth: Auth, request: Request):
             "ingest": result["ingest"],
         },
     )
+
+
+# ===========================================================================
+# POST /v1/skills/reindex/run — background reindex sweep (one batch) (0.99.0)
+# ===========================================================================
+
+
+def _reindex_extract_tags(auth: Auth, name: str, markdown: str, frontmatter: dict, pr: dict | None) -> tuple[dict, str]:
+    """Re-derive discovery tags for one skill. Returns (extraction, used_model).
+
+    Mirrors the ingest extraction (same skill_extract prompt, same deterministic
+    fallback) but stays read-only w.r.t. the graph: the caller feeds the result
+    to maludb_skill_reindex_apply, which rewrites the skill's 'extracted' tags.
+    coerce_skill_extraction is reused for its 'skill'-subject guarantee; the
+    document section it adds is ignored — reindex never re-mints the SKILL.md
+    document. A model that returns no JSON object degrades to the deterministic
+    path so one bad skill never stalls the sweep.
+    """
+    if pr is not None and pr.get("api_key"):
+        entity_block, event_block = _render_type_catalog(auth)
+        system = (
+            str(pr.get("system_prompt", ""))
+            .replace("{{ENTITY_TYPES}}", entity_block)
+            .replace("{{EVENT_KINDS}}", event_block)
+        )
+        user_msg = (
+            f"SKILL_NAME: {name}\n\nFRONTMATTER:\n"
+            f"{json.dumps(frontmatter, ensure_ascii=False)}\n\nSKILL_MD:\n{markdown}\n"
+        )
+        cfg = {
+            "api_format": pr.get("api_format", "openai"),
+            "base_url": pr.get("base_url", ""),
+            "model_identifier": pr.get("model_identifier") or pr.get("model_name"),
+            "token": pr["api_key"],
+            "max_tokens": int(pr.get("max_tokens", 2048)),
+            "generation_params": json.loads(pr["generation_params"]) if pr.get("generation_params") else {},
+        }
+        extraction = llm_json_from_text(llm_complete(cfg, system, user_msg))
+        if extraction is not None:
+            return (
+                coerce_skill_extraction(extraction, name, markdown, frontmatter),
+                pr.get("model_name") or "llm",
+            )
+    discovery = deterministic_discovery(name, frontmatter)
+    extraction = coerce_skill_extraction(
+        {"subjects": [], "verbs": [], "edges": [], "keywords": discovery["keywords"]},
+        name,
+        markdown,
+        frontmatter,
+    )
+    return extraction, "deterministic"
+
+
+def _resolve_subject_ids(auth: Auth, names: list[str]) -> dict[str, int]:
+    """Map lower(canonical_name) -> subject_id for names already in the tenant
+    registry (one batched, read-only lookup). Unknown names stay name-only."""
+    uniq = sorted({n.lower() for n in names if n and n.strip()})
+    if not uniq:
+        return {}
+    rows = db_query(
+        auth.conn,
+        "SELECT lower(canonical_name) AS k, subject_id AS id"
+        "  FROM maludb_subject WHERE lower(canonical_name) = ANY(%s)",
+        [uniq],
+    )
+    return {r["k"]: int(r["id"]) for r in rows if r.get("id") is not None}
+
+
+@router.post("/v1/skills/reindex/run")
+def reindex_skills_run(
+    auth: Auth,
+    limit: int = Query(default=32, le=200),
+    max_age: str | None = Query(default="30 days", max_length=64),
+):
+    """Run one skill-reindex sweep batch for the calling tenant (maludb_core 0.99.0).
+
+    The cron-driven half of the background reindex (DB contract in maludb_core's
+    docs/skill-reindex.md). Claims the stalest skills — never indexed, older than
+    `max_age`, or older than the registry watermark — re-derives their discovery
+    tags against the *current* knowledge graph via the user's `skill_extract`
+    model (or the deterministic fallback), and applies a replace-`extracted`
+    rewrite through maludb_skill_reindex_apply. Curator `manual` tags are
+    preserved by the DB. Intended to be invoked on a schedule by an external
+    cron / systemd timer; also safe to call on demand. One skill's failure is
+    captured in `errors` and does not abort the batch.
+    """
+    # The reindex facades arrived in 0.99.0.
+    has_claim = db_one(
+        auth.conn,
+        "SELECT EXISTS(SELECT 1 FROM pg_proc WHERE proname = 'maludb_skill_reindex_claim') AS ok",
+    )
+    if not has_claim or not has_claim["ok"]:
+        json_error(
+            "reindex_unavailable",
+            "maludb_skill_reindex_claim is not available (requires maludb_core 0.99.0;"
+            " re-run enable_memory_schema('<tenant>') after upgrading).",
+            501,
+        )
+
+    age = (max_age or "").strip() or None
+    rows = db_query(
+        auth.conn,
+        "SELECT skill_id, skill_name, markdown, frontmatter_jsonb"
+        "  FROM maludb_skill_reindex_claim(%s, %s::interval, %s)",
+        [limit, age, True],
+    )
+
+    store = get_auth_store()
+    pr = resolve_task_config(store, auth.user_id, "skill_extract", None)
+
+    reindexed: list[dict] = []
+    errors: list[dict] = []
+    for r in rows:
+        sid = int(r["skill_id"])
+        name = r["skill_name"]
+        markdown = r["markdown"] or ""
+        fm = r["frontmatter_jsonb"] or {}
+        if isinstance(fm, str):
+            try:
+                fm = json.loads(fm)
+            except (json.JSONDecodeError, ValueError):
+                fm = {}
+        try:
+            extraction, used_model = _reindex_extract_tags(auth, name, markdown, fm, pr)
+            names = [str(s.get("name") or "") for s in (extraction.get("subjects") or []) if isinstance(s, dict)]
+            id_map = _resolve_subject_ids(auth, names)
+            params = build_reindex_params(extraction, id_map)
+
+            def _apply(conn, _sid=sid, _p=params, _m=used_model):  # noqa: ANN001, ANN202
+                return db_one(
+                    conn,
+                    "SELECT maludb_skill_reindex_apply("
+                    "  p_skill_id => %s, p_subjects => %s::jsonb, p_verbs => %s::jsonb,"
+                    "  p_keywords => %s, p_model => %s) AS result",
+                    [_sid, json.dumps(_p["subjects"]), json.dumps(_p["verbs"]), _p["keywords"] or None, _m],
+                )
+
+            applied = db_tx_core(auth.conn, _apply)["result"]
+            if isinstance(applied, str):
+                applied = json.loads(applied)
+            reindexed.append({"skill_id": sid, "name": name, "model": used_model, "applied": applied})
+        except Exception as exc:  # one skill's failure must not abort the sweep
+            errors.append({"skill_id": sid, "name": name, "error": str(exc)})
+
+    return {
+        "claimed": len(rows),
+        "reindexed": reindexed,
+        "errors": errors,
+        "model": (pr.get("model_name") if pr else None),
+        "limit": limit,
+        "max_age": age,
+    }
 
 
 # ===========================================================================
@@ -768,8 +989,9 @@ def get_skill_bundle(skill_id: int, auth: Auth):
     )
     files = []
     for r in rows:
-        content = bytes(r["content_bytes"]) if r["content_bytes"] is not None else (
-            r["content_text"] or "").encode("utf-8")
+        content = (
+            bytes(r["content_bytes"]) if r["content_bytes"] is not None else (r["content_text"] or "").encode("utf-8")
+        )
         files.append(
             {
                 "relative_path": r["relative_path"],

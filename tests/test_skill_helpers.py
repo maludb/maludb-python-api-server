@@ -7,6 +7,7 @@ from __future__ import annotations
 import hashlib
 
 from app.helpers.skills import (
+    build_reindex_params,
     bundle_hash,
     coerce_skill_extraction,
     deterministic_discovery,
@@ -77,17 +78,13 @@ class TestMaterialityScreens:
             {"relative_path": "SKILL.md", "file_hash": "aaa"},
             {"relative_path": "scripts/run.py", "file_hash": "EDITED"},
         ]
-        r = materiality_screens(
-            self.PARENT, self.PARENT["markdown"], self.PARENT["frontmatter_jsonb"], files
-        )
+        r = materiality_screens(self.PARENT, self.PARENT["markdown"], self.PARENT["frontmatter_jsonb"], files)
         assert r["verdict"] == "material"
         assert "file:scripts/run.py" in r["reasons"]
 
     def test_file_added_is_material(self):
         files = [*self.NEW_FILES, {"relative_path": "assets/template.txt", "file_hash": "ddd"}]
-        r = materiality_screens(
-            self.PARENT, self.PARENT["markdown"], self.PARENT["frontmatter_jsonb"], files
-        )
+        r = materiality_screens(self.PARENT, self.PARENT["markdown"], self.PARENT["frontmatter_jsonb"], files)
         assert r["verdict"] == "material"
         assert "file:assets/template.txt" in r["reasons"]
 
@@ -155,7 +152,9 @@ class TestCoerceSkillExtraction:
     def test_retypes_existing_skill_subject(self):
         out = coerce_skill_extraction(
             {"subjects": [{"key": "s1", "name": "PDF-Processing", "type": "software"}]},
-            "pdf-processing", "# body", {},
+            "pdf-processing",
+            "# body",
+            {},
         )
         assert len(out["subjects"]) == 1
         assert out["subjects"][0]["type"] == "skill"
@@ -163,3 +162,35 @@ class TestCoerceSkillExtraction:
     def test_keywords_preserved(self):
         out = coerce_skill_extraction({"keywords": ["pdf"]}, "x", "# b", {})
         assert out["keywords"] == ["pdf"]
+
+
+class TestBuildReindexParams:
+    def test_resolves_ids_dedups_and_trims(self):
+        extraction = {
+            "subjects": [{"name": "Ubuntu"}, {"name": "ubuntu"}, {"name": "PDF"}, {"name": "  "}],
+            "verbs": [{"name": "install"}, {"name": "Install"}, {"name": ""}],
+            "keywords": ["setup", "Setup", "  ", "apt"],
+        }
+        # Only 'ubuntu' is known in the registry -> it carries an id; first-wins
+        # keeps the id-bearing form and drops the case-dup.
+        out = build_reindex_params(extraction, {"ubuntu": 42})
+        assert out["subjects"] == [{"name": "Ubuntu", "id": 42}, {"name": "PDF"}]
+        assert out["verbs"] == [{"name": "install"}]
+        assert out["keywords"] == ["setup", "apt"]
+
+    def test_no_ids_keeps_names_only(self):
+        out = build_reindex_params({"subjects": [{"name": "Topic"}]}, {})
+        assert out["subjects"] == [{"name": "Topic"}]
+
+    def test_empty_extraction(self):
+        assert build_reindex_params({}, {}) == {"subjects": [], "verbs": [], "keywords": []}
+
+    def test_ignores_malformed_entries(self):
+        out = build_reindex_params(
+            {"subjects": ["not-a-dict", {"name": "Ok"}], "verbs": [None], "keywords": [1, "k"]},
+            {},
+        )
+        assert out["subjects"] == [{"name": "Ok"}]
+        assert out["verbs"] == []
+        # non-string keywords are coerced via str(); "1" and "k" both survive
+        assert out["keywords"] == ["1", "k"]
