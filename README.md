@@ -162,6 +162,29 @@ see the unit header for install. The sweep reindexes the configured token's
 tenant; run one timer per tenant token for more. (DB-side protocol:
 maludb_core `docs/skill-reindex.md`.)
 
+### Document/note reindex (maludb_core 0.100.0)
+
+`POST /v1/memory/reindex/run` runs one background reindex sweep over documents
+and notes for the calling tenant — the SVPOR-graph analogue of skill reindex.
+It claims the stalest documents via `maludb_memory_reindex_claim` (never
+indexed, older than `?max_age=` — default `30 days`, or older than the registry
+watermark; `?source_type=note` to scope), re-derives each one's SVPOR footprint
+from its stored text with the user's `extract` model, and applies a
+replace-footprint rewrite via `maludb_memory_reindex_apply` (delete the
+`$source`-anchored statements, re-ingest idempotently; shared subjects/verbs
+merge, entity-card embeddings refresh via the 0.95.0 dirty-queue triggers).
+`?limit=` (default 32) caps the batch; a document whose extraction fails is in
+`errors`, one with no `extract` model configured is in `skipped`, and neither
+aborts the sweep. Returns `501` until the 0.100.0 facades are enabled. This is
+what links an old document to subjects/verbs minted *after* it was ingested and
+repairs a weak initial extraction (so `note_search` and graph traversal find it).
+Unlike skills, document reindex **requires** an `extract` model — there is no
+deterministic SVPOR fallback.
+
+Drive it on a schedule with `deploy/maludb-memory-reindex.{service,timer}` (a
+modest 6-hourly cadence, since it calls a model per document) — see the unit
+header for install. (DB-side protocol: maludb_core `docs/document-reindex.md`.)
+
 See [CLAUDE.md](CLAUDE.md) for detailed architecture documentation.
 
 ## Testing
