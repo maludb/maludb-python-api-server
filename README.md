@@ -122,6 +122,25 @@ gains `subject`/`verb` tag search through `maludb_skill_search`. Content
 fields of a registered agent skill are immutable — PATCH answers 409.
 The `malu` CLI front-end is `malu skill push / push-all / list / pull`.
 
+### Note search (maludb_core 0.98.0)
+
+`GET /v1/memory/notes` retrieves notes by the subjects/verbs of their
+extracted edges — a thin wrapper over the `maludb_note_search` facade.
+Structured search: `?subject_like=ubuntu&verb_like=installation` (fuzzy
+verb: bidirectional containment, so `installation` finds `install`) or
+`?subject_like=ubuntu&action=install` (exact canonical/alias verb match).
+Free text: `?q=Install%20Ubuntu` — parsed deterministically against the
+tenant verb catalog (`maludb_note_query_parse`); when no catalog verb
+matches and the user has a `query_parse` model configured (the seeded
+catalog task, prompt `config/prompts/query-parse.system.txt`), the server
+falls back to an LLM parse constrained to the catalog. Defaults to
+documents with `source_type='note'`; `all_sources=true` widens. The MCP
+server exposes the same search as the `find_notes` tool. `POST
+/v1/memory/ingest` now accepts optional `source_type` and `title` body
+fields (the `maludb` CLI sends `source_type: "note"`); notes ingested
+before that default to `source_type='document'` and only surface with
+`all_sources=true`. The CLI front-end is `maludb get note`.
+
 See [CLAUDE.md](CLAUDE.md) for detailed architecture documentation.
 
 ## Testing

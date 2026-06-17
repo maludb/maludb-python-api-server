@@ -24,7 +24,15 @@ _TOKEN = f"malu_{_TOKEN_BODY}"
 _USER_ID = 9
 _HEADERS = {"Authorization": f"Bearer {_TOKEN}"}
 
-_READ_TOOLS = {"search_memory", "find_subjects", "explore_subject", "get_document", "find_skills", "get_skill"}
+_READ_TOOLS = {
+    "search_memory",
+    "find_subjects",
+    "explore_subject",
+    "get_document",
+    "find_notes",
+    "find_skills",
+    "get_skill",
+}
 _WRITE_TOOLS = {"store_memory", "store_document"}
 
 
@@ -189,7 +197,7 @@ class TestInitialize:
 
 
 class TestToolsList:
-    def test_lists_all_eight_tools(self, client: TestClient):
+    def test_lists_all_nine_tools(self, client: TestClient):
         result = rpc(client, "tools/list").json()["result"]
         names = {t["name"] for t in result["tools"]}
         assert names == _READ_TOOLS | _WRITE_TOOLS
@@ -197,7 +205,7 @@ class TestToolsList:
 
     def test_cursor_is_ignored(self, client: TestClient):
         result = rpc(client, "tools/list", {"cursor": "abc"}).json()["result"]
-        assert len(result["tools"]) == 8
+        assert len(result["tools"]) == 9
 
     def test_tool_shapes(self, client: TestClient):
         for tool in rpc(client, "tools/list").json()["result"]["tools"]:

@@ -578,6 +578,8 @@ async def memory_ingest(auth: Auth, request: Request):
     explicit_model = str(body.get("model") or "").strip() or None
     namespace = str(body.get("namespace") or "default").strip() or "default"
     preview = bool(body.get("preview"))
+    source_type = str(body.get("source_type") or "document").strip() or "document"
+    title = str(body.get("title") or "").strip()
 
     # Hints
     hints_raw = body.get("hints")
@@ -603,6 +605,8 @@ async def memory_ingest(auth: Auth, request: Request):
         namespace=namespace,
         explicit_model=explicit_model,
         preview=preview,
+        source_type=source_type,
+        title=title or None,
     )
     if preview:
         return payload
@@ -617,6 +621,8 @@ def ingest_core(
     namespace: str,
     explicit_model: str | None,
     preview: bool,
+    source_type: str = "document",
+    title: str | None = None,
 ) -> dict:
     """The ingest pipeline (resolve model → assemble prompt → LLM → graph
     ingest), shared by the REST route and the MCP store_memory tool.  Returns
@@ -751,8 +757,8 @@ def ingest_core(
     def _ingest(conn):
         doc = db_one(
             conn,
-            "SELECT maludb_upload_document(p_title => %s, p_content_text => %s, p_source_type => 'document') AS id",
-            [text[:80].strip(), text],
+            "SELECT maludb_upload_document(p_title => %s, p_content_text => %s, p_source_type => %s) AS id",
+            [(title or text[:80]).strip(), text, source_type],
         )
         document_id = int(doc["id"])
         row = db_one(
