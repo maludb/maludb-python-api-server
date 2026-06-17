@@ -949,3 +949,103 @@ def memory_reindex_run(
         "max_age": age,
         "source_type": source_type,
     }
+
+
+# ===========================================================================
+# POST /v1/memory/embeddings/run — drain the entity-card embedding queue
+# ===========================================================================
+
+
+def _has_real_embedder(embed_cfg: dict) -> bool:
+    """True if a real embedding endpoint is configured (user 'embed' choice or
+    MALUDB_EMBED_* env) -- as opposed to mem_embed's deterministic fallback,
+    which is not worth persisting as an entity-card vector."""
+    if embed_cfg:
+        return True
+    return bool(
+        os.environ.get("MALUDB_EMBED_BASE_URL")
+        and os.environ.get("MALUDB_EMBED_TOKEN")
+        and os.environ.get("MALUDB_EMBED_MODEL")
+    )
+
+
+@router.post("/v1/memory/embeddings/run")
+def memory_embeddings_run(
+    auth: Auth,
+    limit: int = Query(default=64, le=512),
+    kinds: str | None = Query(default=None, max_length=120),
+):
+    """Drain one batch of the entity-card embedding queue for the calling tenant
+    (the deferred maludb_core 0.95.0 consumer; semantic spine for documents AND skills).
+
+    Claims pending cards via `maludb_embedding_dirty_claim` (subjects/verbs/SVO
+    statements marked dirty by ingest + reindex), embeds each card's text with
+    the user's `embed` model, and stores the vector + refreshes semantic edges
+    via `maludb_embedding_complete` (the bytea is built in SQL from a real[] via
+    `vector_from_real_array(...)::bytea`, so the wire format is the DB's own).
+    `?kinds=subject,verb` scopes; `?limit=` (default 64) caps the batch. Returns
+    early when no real embedding model is configured (the deterministic fallback
+    isn't worth persisting). One card's failure is captured in `errors`.
+    Intended to be invoked on a schedule by an external cron / systemd timer.
+    """
+    has_claim = db_one(
+        auth.conn,
+        "SELECT EXISTS(SELECT 1 FROM pg_proc WHERE proname = 'maludb_embedding_dirty_claim') AS ok",
+    )
+    if not has_claim or not has_claim["ok"]:
+        json_error(
+            "embeddings_unavailable",
+            "maludb_embedding_dirty_claim is not available (requires maludb_core 0.95.0;"
+            " re-run enable_memory_schema('<tenant>') after upgrading).",
+            501,
+        )
+
+    embed_cfg = resolve_embed_config(get_auth_store(), auth.user_id)
+    if not _has_real_embedder(embed_cfg):
+        return {
+            "claimed": 0,
+            "embedded": [],
+            "errors": [],
+            "note": "no embedding model configured (set the 'embed' task or MALUDB_EMBED_* env); skipped",
+        }
+    model_name = embed_cfg.get("embedding_model") or os.environ.get("MALUDB_EMBED_MODEL")
+
+    kinds_arr = [k.strip() for k in kinds.split(",") if k.strip()] if kinds else None
+    rows = db_query(
+        auth.conn,
+        "SELECT object_kind, object_id, generation, card_text, content_hash  FROM maludb_embedding_dirty_claim(%s, %s)",
+        [kinds_arr, limit],
+    )
+
+    embedded: list[dict] = []
+    errors: list[dict] = []
+    for r in rows:
+        kind = r["object_kind"]
+        oid = int(r["object_id"])
+        try:
+            vec = mem_embed(r["card_text"] or "", embed_cfg)
+
+            def _complete(conn, _k=kind, _o=oid, _g=int(r["generation"]), _v=vec, _h=r["content_hash"]):  # noqa: ANN001, ANN202
+                return db_one(
+                    conn,
+                    "SELECT maludb_embedding_complete("
+                    "  p_object_kind => %s, p_object_id => %s, p_generation => %s,"
+                    "  p_embedding => maludb_core.vector_from_real_array(%s::real[])::bytea,"
+                    "  p_embedding_dim => %s, p_embedding_space => 'entity-v1',"
+                    "  p_embedding_model => %s, p_content_hash => %s, p_refresh_neighbors => true) AS id",
+                    [_k, _o, _g, _v, len(_v), model_name, _h],
+                )
+
+            db_tx_core(auth.conn, _complete)
+            embedded.append({"object_kind": kind, "object_id": oid})
+        except Exception as exc:  # one card's failure must not abort the sweep
+            errors.append({"object_kind": kind, "object_id": oid, "error": str(exc)})
+
+    return {
+        "claimed": len(rows),
+        "embedded": embedded,
+        "errors": errors,
+        "model": model_name,
+        "limit": limit,
+        "kinds": kinds_arr,
+    }

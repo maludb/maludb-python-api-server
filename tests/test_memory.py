@@ -28,6 +28,7 @@ _AUTH_PATHS = [
     ("POST", "/v1/memory/search"),
     ("POST", "/v1/memory/ingest"),
     ("POST", "/v1/memory/reindex/run"),
+    ("POST", "/v1/memory/embeddings/run"),
 ]
 
 
