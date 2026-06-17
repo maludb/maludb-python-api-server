@@ -185,6 +185,24 @@ Drive it on a schedule with `deploy/maludb-memory-reindex.{service,timer}` (a
 modest 6-hourly cadence, since it calls a model per document) — see the unit
 header for install. (DB-side protocol: maludb_core `docs/document-reindex.md`.)
 
+### Entity-card embeddings (maludb_core 0.95.0)
+
+`POST /v1/memory/embeddings/run` drains the entity-card embedding queue — the
+long-deferred consumer of maludb_core's 0.95.0 "semantic spine". Ingest and the
+skill/document reindex sweeps mark subjects, verbs, and SVO statements *dirty*;
+this worker claims them via `maludb_embedding_dirty_claim`, embeds each card's
+text with the user's `embed` model, and stores the vector + refreshes semantic
+neighbours via `maludb_embedding_complete` (the `bytea` is built in SQL from a
+`real[]` so the wire format is the DB's own). `?kinds=subject,verb` scopes;
+`?limit=` (default 64) caps the batch. It returns early when no real `embed`
+model is configured (the deterministic fallback isn't worth persisting). This is
+what powers the optional `similar_to` semantic jumps — for **documents and
+skills alike** — so it complements both reindex workers.
+
+Drive it on a schedule with `deploy/maludb-embedding-worker.{service,timer}` (a
+brisker 15-minute cadence — cards are cheap and the claim auto-skips unchanged
+ones, so empty runs are nearly free).
+
 See [CLAUDE.md](CLAUDE.md) for detailed architecture documentation.
 
 ## Testing
