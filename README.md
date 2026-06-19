@@ -1,6 +1,6 @@
 # maludb-python-simple
 
-This serves as both a **working API server** (targeting maludb_core 0.96.0) and a **learning-friendly codebase** — every route handler contains its SQL inline, making the path from URL to query visible in one file.
+This serves as both a **working API server** (targeting maludb_core 0.100.0) and a **learning-friendly codebase** — every route handler contains its SQL inline, making the path from URL to query visible in one file.
 
 ## Quick Start
 
@@ -31,7 +31,7 @@ sudo -u postgres psql -d maludb -c "SET ROLE app; SET search_path TO app, maludb
 sudo -u postgres psql -c "ALTER USER app PASSWORD '#change_on_install#'"
 ```
 
-> **maludb_core is a prerequisite, not part of this repo.** The data endpoints (and minting a token) require the **maludb_core 0.96.0** facade views and functions to already exist in the tenant database. Install them into the `maludb` database above by following the [MaluDB](https://maludb.com) project instructions before continuing past the health check. The server itself — and `/health` — starts without it.
+> **maludb_core is a prerequisite, not part of this repo.** The data endpoints (and minting a token) require the **maludb_core 0.100.0** facade views and functions to already exist in the tenant database. Install them into the `maludb` database above by following the [MaluDB](https://maludb.com) project instructions before continuing past the health check. The server itself — and `/health` — starts without it.
 
 ### 3. Clone and install the API server
 
@@ -69,7 +69,7 @@ Once maludb_core is installed in your tenant database, continue to [Authenticati
 ## Requirements
 
 - Python 3.12+
-- PostgreSQL 17 (with maludb_core 0.96.0 installed)
+- PostgreSQL 17 (with maludb_core 0.100.0 installed)
 - No other services required (SQLite replaces MySQL for auth)
 
 ## Configuration
@@ -98,6 +98,59 @@ All configuration is via environment variables:
    curl http://localhost:8000/v1/subjects \
      -H 'Authorization: Bearer malu_...'
    ```
+
+## Configure an LLM provider and model
+
+The memory pipeline (`/v1/memory/ingest`, `/v1/memory/documents`,
+`/v1/memory/search`) extracts a knowledge graph with an LLM, so each user must
+**store a provider API key** and **choose a model** before ingest works. Until
+then, `/v1/memory/ingest` falls back to the legacy `chatgpt-4o` default — which
+has no prompt configured — and returns:
+
+```
+model_not_configured: No prompt configured for model "chatgpt-4o" and no
+model config for namespace "default".
+```
+
+These endpoints are Bearer-authenticated (use the token from
+[Authentication](#authentication)) and keyed by your `user_id`, so every token a
+user holds shares the same keys and model choices.
+
+1. See the seeded catalog and your current key/choice state — each row reports
+   `key_set` and `is_choice`:
+   ```bash
+   curl http://localhost:8000/v1/llm/catalog \
+     -H 'Authorization: Bearer malu_...'
+   ```
+
+2. Store your provider API key. The `provider` must be one the catalog lists
+   (e.g. `openai`, `anthropic`, `google`, `xai`, `deepseek`, `ollama`); the key
+   is stored server-side and is never returned:
+   ```bash
+   curl -X PUT http://localhost:8000/v1/llm/providers/openai \
+     -H 'Authorization: Bearer malu_...' \
+     -H 'Content-Type: application/json' \
+     -d '{"api_key":"sk-..."}'
+   ```
+
+3. Choose the extraction model (a `model_name` from the catalog). Tasks are
+   `extract` (notes/documents), `embed` (search + document embeddings), and
+   `skill_extract`:
+   ```bash
+   curl -X PUT http://localhost:8000/v1/llm/models/extract \
+     -H 'Authorization: Bearer malu_...' \
+     -H 'Content-Type: application/json' \
+     -d '{"model_name":"gpt-4o"}'
+   ```
+
+If you choose a model whose provider has no stored key, the response includes a
+`warning` naming the provider to set a key for. To enable search and document
+push, repeat step 3 against `/v1/llm/models/embed` with an embedding model.
+
+> The `maludb` CLI wraps these three calls as `maludb llm catalog`,
+> `maludb llm set-key <provider>`, and `maludb llm use <model>`. The older
+> `POST /v1/model-prompts` / `POST /v1/memory/config` paths still work but
+> require raw Postgres credentials rather than a bearer token.
 
 ## Architecture
 
