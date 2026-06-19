@@ -10,16 +10,25 @@ These steps take a **fresh Ubuntu 24.04 LTS** machine — nothing installed beyo
 
 ```bash
 sudo apt update
-sudo apt install -y git curl python3-venv python3-pip postgresql postgresql-contrib
+sudo apt install -y git curl python3-venv python3-pip postgresql-17
+
+# Pin PostgreSQL 18 so apt never offers to upgrade the cluster past 17.
+# (17.x still receives its security patches; only the 18 major is blocked.)
+sudo tee /etc/apt/preferences.d/no-postgresql-18 >/dev/null <<'EOF'
+Package: postgresql-18 postgresql-client-18 postgresql-server-dev-18
+Pin: release *
+Pin-Priority: -1
+EOF
 ```
+
+> **Why `postgresql-17` and not `postgresql`?** The unversioned `postgresql` meta-package always depends on the newest major version available in the apt repo, so once PostgreSQL 18 ships it would offer to upgrade your cluster. Installing the versioned package — plus the pin above — keeps you on 17, which is what maludb_core targets.
 
 ### 2. Create the tenant PostgreSQL database
 
 The API is multi-tenant: every token maps to a PostgreSQL database that holds the actual knowledge graph. Create a login role and a database for your tenant. Maludb-core should be installed with a database, user account, and schema already created.  If it is not, you can create a new database named 'maludu', with a user and schema both named 'app' with the instructions below.
 
-DO NOT
-DO NOT - DO NOT UPGRADE POSTGRES TO VERSION 18
-DO NOT
+> **Stay on PostgreSQL 17.** maludb_core targets PG 17 — do not upgrade the cluster to 18. The pin added in step 1 prevents apt from offering the upgrade.
+
 ```bash
 sudo -u postgres createdb maludb
 sudo -u postgres psql -d maludb -c "CREATE EXTENSION maludb_core CASCADE"
