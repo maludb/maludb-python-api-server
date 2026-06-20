@@ -23,7 +23,9 @@ EOF
 
 > **Why `postgresql-17` and not `postgresql`?** The unversioned `postgresql` meta-package always depends on the newest major version available in the apt repo, so once PostgreSQL 18 ships it would offer to upgrade your cluster. Installing the versioned package — plus the pin above — keeps you on 17, which is what maludb_core targets.
 
-### 2. Create the tenant PostgreSQL database
+### 2. Create the tenant PostgreSQL database (ONLY IF NOT DONE IN CORE INSTALL)
+
+THIS PROCESS IS USUALLY PERFORMED WHEN THE MALUDB-CORE IS INSTALLED.  If unsure, check with your system adminidstrator.
 
 The API is multi-tenant: every token maps to a PostgreSQL database that holds the actual knowledge graph. Create a login role and a database for your tenant. Maludb-core should be installed with a database, user account, and schema already created.  If it is not, you can create a new database named 'maludu', with a user and schema both named 'app' with the instructions below.
 
