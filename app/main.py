@@ -32,6 +32,7 @@ from app.routers import (
     llm_config,
     mcp,
     memory,
+    memory_maintenance,
     memory_notes,
     model_prompts,
     notes,
@@ -64,6 +65,7 @@ app.include_router(graph.router)
 app.include_router(llm_config.router)
 app.include_router(mcp.router)
 app.include_router(memory.router)
+app.include_router(memory_maintenance.router)
 app.include_router(memory_notes.router)
 app.include_router(model_prompts.router)
 app.include_router(notes.router)
@@ -92,6 +94,7 @@ app.add_exception_handler(Exception, unhandled_error_handler)  # type: ignore[ar
 # ---------------------------------------------------------------------------
 # Per-request middleware — SqlTracer + connection cleanup + debug injection
 # ---------------------------------------------------------------------------
+
 
 class TracerMiddleware(BaseHTTPMiddleware):
     """Middleware that creates a fresh SqlTracer per request, sets endpoint
@@ -158,6 +161,7 @@ app.add_middleware(TracerMiddleware)
 # ---------------------------------------------------------------------------
 # Health endpoint
 # ---------------------------------------------------------------------------
+
 
 @app.get("/health")
 async def health() -> dict:
