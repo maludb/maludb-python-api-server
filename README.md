@@ -212,6 +212,28 @@ Drive it on a schedule with `deploy/maludb-embedding-worker.{service,timer}` (a
 brisker 15-minute cadence — cards are cheap and the claim auto-skips unchanged
 ones, so empty runs are nearly free).
 
+### Memory maintenance (lifecycle / consolidation / scoring)
+
+A small family of endpoints exposes maludb_core's memory-lifecycle functions so an
+external maintenance agent can organize memories through the API instead of SQL.
+Each is a thin proxy over an executor-granted `maludb_core` function (no per-schema
+facade needed) and returns `501` if the core build predates the function:
+
+- `POST /v1/memory/consolidate` — merge memories into a new consolidated memory
+  (`consolidate_memories`).
+- `POST /v1/memory/lifecycle` — transition an object's lifecycle state
+  (`apply_lifecycle_state`).
+- `POST /v1/memory/staleness` — mark an object and its dependents stale
+  (`propagate_staleness`).
+- `POST /v1/memory/score` — set a MAUT subscore (`set_maut_score`).
+- `POST /v1/memory/reinforcement` — append a reinforcement event
+  (`record_reinforcement`).
+- `GET /v1/memory/retention-candidates` — list objects eligible for retention
+  review (`retention_candidates`).
+
+All write actions run inside `db_tx_core`; destructive transitions remain the
+caller's responsibility to gate (the agent does so via per-tenant policy + review).
+
 See [CLAUDE.md](CLAUDE.md) for detailed architecture documentation.
 
 ## Testing
