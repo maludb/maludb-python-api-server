@@ -25,22 +25,22 @@ EOF
 
 ### 2. Create the tenant PostgreSQL database
 
-The API is multi-tenant: every token maps to a PostgreSQL database that holds the actual knowledge graph. Create a login role and a database for your tenant. Maludb-core should be installed with a database, user account, and schema already created.  If it is not, you can create a new database named 'maludu', with a user and schema both named 'app' with the instructions below.
+The API is multi-tenant: every token maps to a PostgreSQL database that holds the actual knowledge graph. The maludb_core bootstrap creates its own `maludb` database for the extension itself — **that is not your tenant database, so don't point a token at it.** Instead create a separate application database (named `mydb` here) and install the `maludb_core` extension into it, along with a login role and schema both named `app`. If maludb_core was already installed with your own application database, user, and schema, you can skip these commands.
 
 > **Stay on PostgreSQL 17.** maludb_core targets PG 17 — do not upgrade the cluster to 18. The pin added in step 1 prevents apt from offering the upgrade.
 
 ```bash
-sudo -u postgres createdb maludb
-sudo -u postgres psql -d maludb -c "CREATE EXTENSION maludb_core CASCADE"
-sudo -u postgres psql -d maludb -tAc "SELECT maludb_core.maludb_core_version()"
-sudo -u postgres psql -d maludb -c "CREATE USER app"
-sudo -u postgres psql -d maludb -c "CREATE SCHEMA app AUTHORIZATION app"
-sudo -u postgres psql -d maludb -c "SELECT * FROM maludb_core.enable_memory_schema('app')"
-sudo -u postgres psql -d maludb -c "SET ROLE app; SET search_path TO app, maludb_core, public; SELECT * FROM maludb_subject"
+sudo -u postgres createdb mydb
+sudo -u postgres psql -d mydb -c "CREATE EXTENSION maludb_core CASCADE"
+sudo -u postgres psql -d mydb -tAc "SELECT maludb_core.maludb_core_version()"
+sudo -u postgres psql -d mydb -c "CREATE USER app"
+sudo -u postgres psql -d mydb -c "CREATE SCHEMA app AUTHORIZATION app"
+sudo -u postgres psql -d mydb -c "SELECT * FROM maludb_core.enable_memory_schema('app')"
+sudo -u postgres psql -d mydb -c "SET ROLE app; SET search_path TO app, maludb_core, public; SELECT * FROM maludb_subject"
 sudo -u postgres psql -c "ALTER USER app PASSWORD '#change_on_install#'"
 ```
 
-> **maludb_core is a prerequisite, not part of this repo.** The data endpoints (and minting a token) require the **maludb_core 0.96.0** facade views and functions to already exist in the tenant database. Install them into the `maludb` database above by following the [MaluDB](https://maludb.com) project instructions before continuing past the health check. The server itself — and `/health` — starts without it.
+> **maludb_core is a prerequisite, not part of this repo.** The data endpoints (and minting a token) require the **maludb_core 0.96.0** facade views and functions to already exist in the tenant database. Install them into the `mydb` database above by following the [MaluDB](https://maludb.com) project instructions before continuing past the health check. The server itself — and `/health` — starts without it.
 
 ### 3. Clone and install the API server
 
@@ -73,7 +73,67 @@ curl http://localhost:8000/health
 # {"status":"ok"}
 ```
 
-Once maludb_core is installed in your tenant database, continue to [Authentication](#authentication) to mint your first token.
+Once maludb_core is installed in your tenant database, continue to [step 6, Authentication](#6-authentication) to mint your first token.
+
+### 6. Authentication
+
+1. Mint a token by proving your Postgres login:
+   ```bash
+   curl -X POST http://localhost:8000/v1/tokens \
+     -H 'Content-Type: application/json' \
+     -d '{"pg_dbname":"mydb","pg_user":"app","pg_password":"#change_on_install#"}'
+   ```
+
+2. Use the returned token for all other requests:
+   ```bash
+   curl http://localhost:8000/v1/subjects \
+     -H 'Authorization: Bearer malu_...'
+   ```
+
+### 7. Automate
+
+The dev server from [step 4](#4-run-the-dev-server) stops the moment you close the
+shell — and `--reload` is for development, not production. To keep the API running
+across logouts and reboots, install it as a **systemd service**. The repo ships a
+ready-made unit at [`deploy/maludb-api.service`](deploy/maludb-api.service).
+
+1. **Review the unit** and adjust `User`, `Group`, `WorkingDirectory`, and the
+   `ExecStart`/`EnvironmentFile` paths if your checkout doesn't live at
+   `/home/maludb/maludb-python-api-server` or runs as another user. The shipped
+   unit runs uvicorn with `--workers 2` (no `--reload`) bound to `0.0.0.0:8000`.
+
+2. **Install and enable it** so it starts now and on every boot:
+   ```bash
+   sudo cp deploy/maludb-api.service /etc/systemd/system/maludb-api.service
+   sudo systemctl daemon-reload
+   sudo systemctl enable --now maludb-api
+   ```
+   `enable --now` both starts the service immediately and registers it to launch
+   automatically at boot.
+
+3. **Confirm it's serving** (same health check as step 5, now backed by systemd):
+   ```bash
+   curl http://localhost:8000/health
+   sudo systemctl status maludb-api
+   ```
+
+Manage the running service with `systemctl`:
+
+```bash
+sudo systemctl start maludb-api      # start it
+sudo systemctl stop maludb-api       # stop it
+sudo systemctl restart maludb-api    # full restart (briefly drops connections)
+sudo systemctl reload maludb-api     # graceful: reload workers, keep the socket open
+```
+
+> **`reload` vs `restart`.** Because the unit runs with `--workers`, `reload`
+> sends `SIGHUP` to the uvicorn master process, which gracefully restarts its
+> workers — picking up new code (e.g. after a `git pull`) without dropping the
+> listening socket or in-flight requests. Use `restart` instead when you change
+> the unit file itself or its environment, since those are read only at startup.
+
+Follow the logs with `journalctl -u maludb-api -f`. To take the service back out
+of the boot sequence, run `sudo systemctl disable --now maludb-api`.
 
 ## Requirements
 
@@ -92,21 +152,6 @@ All configuration is via environment variables:
 | `MALUDB_AUTH_STORE` | `data/auth.db` | SQLite auth database path |
 | `MALUDB_DEBUG` | (unset) | Set to `1` to enable `?debug=1` |
 | `MALUDB_LOG_DIR` | `/var/log/maludb` | Log directory |
-
-## Authentication
-
-1. Mint a token by proving your Postgres login:
-   ```bash
-   curl -X POST http://localhost:8000/v1/tokens \
-     -H 'Content-Type: application/json' \
-     -d '{"pg_dbname":"mydb","pg_user":"myuser","pg_password":"mypass"}'
-   ```
-
-2. Use the returned token for all other requests:
-   ```bash
-   curl http://localhost:8000/v1/subjects \
-     -H 'Authorization: Bearer malu_...'
-   ```
 
 ## Architecture
 

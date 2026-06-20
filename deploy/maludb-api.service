@@ -28,6 +28,11 @@ EnvironmentFile=-/home/maludb/maludb-python-api-server/config/maludb.env
 ExecStart=/home/maludb/maludb-python-api-server/.venv/bin/uvicorn app.main:app \
           --host 0.0.0.0 --port 8000 --workers 2
 
+# `systemctl reload` → SIGHUP to the uvicorn master, which gracefully restarts
+# the workers (picking up new code) without dropping the listening socket.
+# Requires --workers above; without it there is no master to receive the signal.
+ExecReload=/bin/kill -HUP $MAINPID
+
 Restart=on-failure
 RestartSec=3
 
