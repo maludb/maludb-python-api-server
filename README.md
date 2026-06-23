@@ -66,6 +66,10 @@ pip install -e ".[dev]"
 uvicorn app.main:app --reload --port 8000
 ```
 
+> **`Command 'uvicorn' not found, but can be installed with: sudo apt install uvicorn`?** **Do not run that apt command** — `uvicorn` is a *project* dependency (it lives in `pyproject.toml`), not a system package. The command exists only after step 3's `pip install -e ".[dev]"` completes. Two things to verify:
+> 1. **You're inside the repo.** The shell prompt should end in `maludb-python-api-server`, not `~`. `pip install -e .` needs the `pyproject.toml` that lives at the repo root — and the `.venv` should be created *inside* the repo, not in your home directory. `cd ~/maludb-python-api-server` first.
+> 2. **You ran the install.** With the venv active (`source .venv/bin/activate`, prompt shows `(.venv)`), run `pip install -e ".[dev]"`, then confirm with `which uvicorn` — it should point inside `.venv/bin/`.
+
 The SQLite auth store (`data/auth.db`) is created and migrated automatically on first use — there is no manual database bootstrap step.
 
 ### 5. Verify
@@ -76,6 +80,28 @@ curl http://localhost:8000/health
 ```
 
 Once maludb_core is installed in your tenant database, continue to [Authentication](#authentication) to mint your first token.
+
+### 6. (Optional) Run on boot as a systemd service
+
+The dev server in step 4 runs in your terminal, prints reload logs, and stops the moment you close the shell — fine for development, wrong for a server you want back after a reboot. To run the API as a managed background service that starts automatically on boot, install the bundled unit at [`deploy/maludb-api.service`](deploy/maludb-api.service):
+
+```bash
+# The unit assumes the repo lives at /home/maludb/maludb-python-api-server and runs
+# as user `maludb`. Edit User/Group/WorkingDirectory/ExecStart if your setup differs.
+sudo cp deploy/maludb-api.service /etc/systemd/system/maludb-api.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now maludb-api      # start now AND on every boot
+
+systemctl status maludb-api                 # confirm it's active (running)
+curl http://localhost:8000/health           # {"status":"ok"}
+```
+
+Notes:
+- The unit runs `uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 2` — production settings (multiple workers, **no `--reload`**), not the dev server from step 4. If a reverse proxy is the only front door, tighten `--host` to `127.0.0.1` in the unit.
+- Put any non-default `MALUDB_*` variables in `config/maludb.env`; the unit loads it via `EnvironmentFile=-` (the leading `-` means "ignore if the file is absent"). Keep that file out of git — it may hold secrets.
+- Follow the logs with `journalctl -u maludb-api -f`. `systemctl restart maludb-api` after pulling new code.
+
+The background workers (skill/document reindex, embeddings) ship their own systemd `*.service` + `*.timer` pairs in `deploy/` — see [Architecture](#architecture) and each unit's header comment for install steps.
 
 ## Requirements
 
