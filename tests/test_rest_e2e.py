@@ -60,6 +60,7 @@ def scratch_table():
             "  tags text[],"
             '  "dueAt" timestamptz,'
             "  amount numeric(30, 10),"
+            "  blob bytea,"
             "  UNIQUE (title))"
         )
     yield
@@ -208,6 +209,47 @@ class TestRestFlavorE2E:
         assert r.status_code == 400
         r = client.get(f"/rest/v1/{TABLE}?title=eq.nope")
         assert r.json() == []
+
+    def test_offset_only_delete_not_capped(self, client, scratch_table):
+        """Offset-only writes must not inherit the default LIMIT 1000."""
+        import psycopg
+
+        with psycopg.connect(DSN, autocommit=True) as conn:
+            conn.execute(f"INSERT INTO \"{TABLE}\" (title) SELECT 'cap ' || n FROM generate_series(1, 1500) n")
+        r = client.delete(f"/rest/v1/{TABLE}?title=like.cap *&order=id&offset=0")
+        assert r.status_code == 204
+        r = client.get(f"/rest/v1/{TABLE}?title=like.cap *", headers={"Prefer": "count=exact"})
+        assert r.headers["content-range"].endswith("/0")  # all 1500 gone, not 500 left
+
+    def test_bytea_read_is_hex(self, client):
+        import psycopg
+
+        with psycopg.connect(DSN, autocommit=True) as conn:
+            conn.execute(
+                f"INSERT INTO \"{TABLE}\" (title, blob) VALUES ('binary', %s)",
+                [b"\x89PNG\xff"],
+            )
+        r = client.get(f"/rest/v1/{TABLE}?title=eq.binary&select=blob")
+        assert r.status_code == 200
+        assert r.json() == [{"blob": "\\x89504e47ff"}]
+        client.delete(f"/rest/v1/{TABLE}?title=eq.binary")
+
+    def test_over_max_limit_clamps(self, client):
+        r = client.get(f"/rest/v1/{TABLE}?limit=2000")
+        assert r.status_code == 200  # Supabase max-rows behavior: clamp, not 422
+
+    def test_debug_filter_shape_rejected(self, client):
+        r = client.delete(f"/rest/v1/{TABLE}?debug=eq.true")
+        assert r.status_code == 400
+
+    def test_heterogeneous_merge_upsert_rejected(self, client):
+        r = client.post(
+            f"/rest/v1/{TABLE}?on_conflict=title",
+            json=[{"title": "h1", "done": True}, {"title": "h2"}],
+            headers={"Prefer": "resolution=merge-duplicates"},
+        )
+        assert r.status_code == 400
+        assert "keys must match" in r.json()["message"]
 
 
 class TestTablesFlavorE2E:

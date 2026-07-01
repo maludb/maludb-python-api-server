@@ -130,6 +130,34 @@ A workflow-backed review found 10 defects, all fixed the same day:
 Re-verified after the fixes: 468 unit + 19 e2e tests green (new regression
 tests cover every finding), supabase-py compat script passes.
 
+### Second review round (high effort, 2026-07-01)
+
+A second workflow review of the fixed branch found 10 more, all addressed:
+1. Filter-shaped `?debug=eq.x` was silently dropped (unfiltering a write!) →
+   now rejected with 400 unless the value is the documented `0`/`1`.
+2. Offset-only writes dragged the default LIMIT 1000 into the ctid window →
+   the window now uses only the client's explicit limit/offset.
+3. Heterogeneous bulk merge-upserts overwrote unmentioned columns with
+   DEFAULT → rejected (PostgREST's "all object keys must match").
+4. `bytea` values crashed JSON serialization → returned as `\x…` hex.
+5. Decimal responses lose precision through float → **documented divergence**
+   (stdlib json cannot emit exact decimal digits; JS clients reparse to float
+   regardless).
+6. `?columns=`/`?on_conflict=` collided with same-named table columns in the
+   RETURNING-select parse → reserved on the POST path.
+7. Over-max `?limit=` returned 422, breaking supabase-js `.range()` →
+   reflected specs clamp (`QuerySpec.clamp_limit`), matching max-rows.
+8. Alias quoting changes `?select=Alias:col` casing on the pre-existing memory
+   endpoints (was case-folded to lowercase) → **accepted intentionally**;
+   PostgREST preserves alias case and reflected columns require quoting.
+9. Quoted `?columns=` names containing commas mis-split → quote-aware
+   tokenizer (`_split_columns`).
+10. PK catalog query ran on every request → reflected lazily
+    (`include_pk=True` on the insert path only).
+
+Final state: 500 tests green (unit + 25 e2e regression tests), lint/format
+clean on touched files, supabase-py compat script passes.
+
 ## Progress
 
 - **Phase 0 — done.** `app/helpers/query.py` (`QuerySpec`/`Col`/`parse_query`/`build_where`) + unit tests in `tests/test_query.py`.

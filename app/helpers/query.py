@@ -69,6 +69,9 @@ class QuerySpec:
     default_select: list[str] | None = None  # None → all columns, in declared order
     default_limit: int = 50
     max_limit: int = 200
+    # True → an over-max ?limit= is clamped to max_limit (PostgREST/Supabase
+    # max-rows behavior, used by the reflected user-table API); False → 422.
+    clamp_limit: bool = False
 
 
 @dataclass(frozen=True)
@@ -312,12 +315,18 @@ def _build_and_group(raw: str, spec: QuerySpec) -> tuple[str, list]:
 # ---------------------------------------------------------------------------
 
 
-def _quote_alias(name: str) -> str:
-    """Double-quote a SQL output alias. Spec column names may come from catalog
-    reflection (app/helpers/reflect.py) and can be mixed-case or contain any
-    character; unquoted they would case-fold or be a syntax error. Quoting is a
-    no-op for the lowercase identifiers the hand-written routers use."""
+def quote_ident(name: str) -> str:
+    """Double-quote a SQL identifier (doubling embedded quotes).
+
+    Used for output aliases here and for reflected table/column identifiers in
+    app/helpers/reflect.py. Spec column names may come from catalog reflection
+    and can be mixed-case or contain any character; unquoted they would
+    case-fold or be a syntax error. Quoting is a no-op for the lowercase
+    identifiers the hand-written routers use."""
     return '"' + name.replace('"', '""') + '"'
+
+
+_quote_alias = quote_ident
 
 
 def _build_select(value: str, spec: QuerySpec) -> tuple[str, list[str]]:
@@ -457,7 +466,9 @@ def parse_query(query_params, spec: QuerySpec, *, reserved: tuple[str, ...] = ()
     if limit < 0:
         raise _invalid("'limit' must be >= 0.")
     if limit > spec.max_limit:
-        raise _invalid(f"'limit' must be <= {spec.max_limit}.")
+        if not spec.clamp_limit:
+            raise _invalid(f"'limit' must be <= {spec.max_limit}.")
+        limit = spec.max_limit
 
     offset = _parse_int(query_params.get("offset"), 0, "offset")
     if offset < 0:

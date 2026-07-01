@@ -18,6 +18,7 @@ from app.main import app
 from app.routers.rest import (
     _check_insert_keys,
     _check_known_keys,
+    _split_columns,
     build_delete_sql,
     build_insert_sql,
     build_update_sql,
@@ -39,6 +40,7 @@ def make_table(name: str = "todos", pk: list[str] | None = None) -> TableInfo:
         default_order=[],
         default_limit=REST_DEFAULT_LIMIT,
         max_limit=REST_MAX_LIMIT,
+        clamp_limit=True,
     )
     return TableInfo(
         name=name,
@@ -241,7 +243,7 @@ class TestBuildUpdateDelete:
         """?limit= on DELETE must window via ctid — never silently over-delete."""
         ti = make_table()
         qp = parsed("done=is.true&order=id&limit=1", ti)
-        sql, params = build_delete_sql(ti, qp, None, windowed=True)
+        sql, params = build_delete_sql(ti, qp, None, window=(True, False))
         assert sql == (
             'DELETE FROM "todos" WHERE ctid IN '
             '(SELECT ctid FROM "todos" WHERE "done" IS TRUE ORDER BY "id" ASC LIMIT %s)'
@@ -251,12 +253,22 @@ class TestBuildUpdateDelete:
     def test_windowed_update_param_order(self):
         ti = make_table()
         qp = parsed("id=gte.10&limit=2&offset=1", ti)
-        sql, params = build_update_sql(ti, {"done": True}, qp, None, windowed=True)
+        sql, params = build_update_sql(ti, {"done": True}, qp, None, window=(True, True))
         assert sql == (
             'UPDATE "todos" SET "done" = %s WHERE ctid IN '
             '(SELECT ctid FROM "todos" WHERE "id" >= %s  LIMIT %s OFFSET %s)'
         )
         assert params == [True, 10, 2, 1]
+
+    def test_offset_only_window_has_no_limit(self):
+        """?offset= without ?limit= must NOT drag the default LIMIT 1000 into
+        the write — that would silently cap a bulk delete."""
+        ti = make_table()
+        qp = parsed("done=is.true&offset=5", ti)
+        sql, params = build_delete_sql(ti, qp, None, window=(False, True))
+        assert "LIMIT" not in sql
+        assert sql.endswith("OFFSET %s)")
+        assert params == [5]
 
 
 # ---------------------------------------------------------------------------
@@ -293,3 +305,56 @@ class TestAdaptAndInsertKeys:
 
     def test_insert_allows_its_keys(self):
         _check_insert_keys(QueryParams("select=id&columns=title&on_conflict=id&debug=1"))  # no raise
+
+    def test_filter_shaped_debug_rejected(self):
+        """?debug=eq.true must not be silently dropped (it would unfilter a
+        write on a table with a `debug` column) — reject and point at and=()."""
+        ti = make_table()
+        with pytest.raises(APIError) as exc:
+            _check_known_keys(QueryParams("debug=eq.true"), ti.spec)
+        assert exc.value.status == 400
+        with pytest.raises(APIError):
+            _check_insert_keys(QueryParams("debug=eq.true"))
+        _check_known_keys(QueryParams("debug=1"), ti.spec)  # trace flag still fine
+
+
+class TestSplitColumns:
+    def test_plain_and_quoted(self):
+        assert _split_columns("a,b") == ["a", "b"]
+        assert _split_columns('"sku","name"') == ["sku", "name"]
+
+    def test_quoted_name_containing_comma(self):
+        assert _split_columns('"a,b","title"') == ["a,b", "title"]
+
+    def test_doubled_quotes_unescaped(self):
+        assert _split_columns('"we""ird"') == ['we"ird']
+
+
+class TestLimitClamp:
+    def test_over_max_clamps_when_flagged(self):
+        ti = make_table()  # reflect specs set clamp_limit=True
+        qp = parse_query(QueryParams("limit=2000"), ti.spec)
+        assert qp.limit == REST_MAX_LIMIT
+
+    def test_over_max_still_422_without_flag(self):
+        spec = QuerySpec(columns={"id": Col('"id"', int)}, max_limit=10)
+        with pytest.raises(APIError) as exc:
+            parse_query(QueryParams("limit=11"), spec)
+        assert exc.value.status == 422
+
+
+class TestHeterogeneousUpsert:
+    def test_merge_upsert_requires_matching_keys(self):
+        """A merge upsert with heterogeneous items would overwrite unmentioned
+        columns with DEFAULT — reject like PostgREST does."""
+        ti = make_table()
+        items = [{"id": 1, "title": "a"}, {"id": 2, "done": True}]
+        with pytest.raises(APIError) as exc:
+            build_insert_sql(ti, items, None, None, "merge-duplicates", None)
+        assert exc.value.status == 400
+        # plain insert (no resolution) keeps the DEFAULT-fill behavior
+        sql, _ = build_insert_sql(ti, items, None, None, None, None)
+        assert "DEFAULT" in sql
+        # ignore-duplicates never updates, so heterogeneous is safe too
+        sql, _ = build_insert_sql(ti, items, None, None, "ignore-duplicates", None)
+        assert sql.endswith("DO NOTHING")

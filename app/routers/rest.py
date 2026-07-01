@@ -114,12 +114,31 @@ async def _read_json(request: Request):
 _GRAMMAR_KEYS = frozenset({"select", "order", "limit", "offset", "or", "and", "debug"})
 _RESERVED = ("debug",)
 
-# POST is not a filtered operation: only these keys are meaningful.
+# POST is not a filtered operation: only these keys are meaningful. `columns`
+# and `on_conflict` are reserved from RETURNING-select parsing too, so a table
+# column with either name can't shadow the control param.
 _INSERT_KEYS = frozenset({"select", "columns", "on_conflict", "debug"})
+_INSERT_RESERVED = ("debug", "columns", "on_conflict")
+
+
+def _check_debug_value(query_params) -> None:
+    """`debug` is reserved for the SQL-trace flag (?debug=1). A filter-shaped
+    value (?debug=eq.true on a table with a `debug` column) must NOT be
+    silently dropped — that would unfilter a write. Reject it and point at the
+    and=() group, which reaches the column unambiguously."""
+    value = query_params.get("debug")
+    if value not in (None, "", "0", "1"):
+        json_error(
+            "bad_request",
+            "'debug' is reserved for the SQL trace (?debug=1). "
+            "To filter a column named 'debug', use and=(debug.<op>.<value>).",
+            400,
+        )
 
 
 def _check_known_keys(query_params, spec, extra: frozenset[str] = frozenset()) -> None:
     """Reject query keys that are neither grammar keys nor spec columns."""
+    _check_debug_value(query_params)
     for key in query_params.keys():
         if key in _GRAMMAR_KEYS or key in extra:
             continue
@@ -130,6 +149,7 @@ def _check_known_keys(query_params, spec, extra: frozenset[str] = frozenset()) -
 def _check_insert_keys(query_params) -> None:
     """POST allows no filter/order/pagination params — reject them explicitly
     rather than parse-and-ignore (the same footgun class strict checking closes)."""
+    _check_debug_value(query_params)
     for key in query_params.keys():
         if key not in _INSERT_KEYS:
             json_error(
@@ -151,12 +171,23 @@ def _known_column(ti: TableInfo, name: str, where: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _unquote(name: str) -> str:
-    """Strip PostgREST-style double quotes from a client column name
-    (supabase clients send ``?columns="sku","name"``)."""
-    if len(name) >= 2 and name.startswith('"') and name.endswith('"'):
-        return name[1:-1].replace('""', '"')
-    return name
+# One ?columns=/-?on_conflict= token: a PostgREST-quoted name (which may contain
+# commas or doubled quotes) or a bare name up to the next comma.
+_COLUMNS_TOKEN = re.compile(r'"((?:[^"]|"")*)"|([^,]+)')
+
+
+def _split_columns(param: str) -> list[str]:
+    """Split a PostgREST column-list param (``a,b`` or ``"sku","name"``),
+    honoring quotes — a quoted name may itself contain commas."""
+    cols: list[str] = []
+    for m in _COLUMNS_TOKEN.finditer(param):
+        if m.group(1) is not None:
+            cols.append(m.group(1).replace('""', '"'))
+        else:
+            token = m.group(2).strip()
+            if token:
+                cols.append(token)
+    return cols
 
 
 def _adapt(value, data_type: str | None):
@@ -173,11 +204,16 @@ def _adapt(value, data_type: str | None):
     return value
 
 
-def _jsonable(data):
-    """JSON-encode DB values (Decimal, datetime, UUID, …) for a direct JSONResponse."""
-    from fastapi.encoders import jsonable_encoder
-
-    return jsonable_encoder(data)
+def _encode_rows(rows: list[dict]) -> list[dict]:
+    """Post-process DB rows for JSON: bytea values become PostgREST-style hex
+    strings (``\\x…``) — raw bytes would crash the strict-UTF-8 JSON encoder.
+    (Other types — datetime, UUID, Decimal — are handled by FastAPI's encoder;
+    note Decimal→float is lossy past ~15 digits, a documented divergence.)"""
+    for row in rows:
+        for key, value in row.items():
+            if isinstance(value, (bytes, memoryview)):
+                row[key] = "\\x" + bytes(value).hex()
+    return rows
 
 
 def build_insert_sql(
@@ -195,7 +231,7 @@ def build_insert_sql(
     are validated against the reflected table and quoted from catalog names.
     """
     if columns_param is not None:
-        cols = [_unquote(c.strip()) for c in columns_param.split(",") if c.strip()]
+        cols = _split_columns(columns_param)
         if not cols:
             json_error("bad_request", "Empty 'columns' list.", 400)
     else:
@@ -229,11 +265,7 @@ def build_insert_sql(
 
     if resolution:
         if on_conflict_param:
-            target = [
-                _known_column(ti, _unquote(c.strip()), "'on_conflict'")
-                for c in on_conflict_param.split(",")
-                if c.strip()
-            ]
+            target = [_known_column(ti, c, "'on_conflict'") for c in _split_columns(on_conflict_param)]
         else:
             target = ti.pk
         if not target:
@@ -242,6 +274,18 @@ def build_insert_sql(
                 f"Upsert on '{ti.name}' needs '?on_conflict=' — the table has no primary key.",
                 400,
             )
+        if resolution == "merge-duplicates":
+            # A merge-upsert writes EVERY insert column of a conflicting row; a
+            # row missing a key would overwrite the stored value with DEFAULT.
+            # PostgREST rejects heterogeneous bulk bodies for exactly this reason.
+            for item in items:
+                for c in cols:
+                    if c not in item:
+                        json_error(
+                            "bad_request",
+                            f"All object keys must match for a merge-duplicates upsert ('{c}' is missing).",
+                            400,
+                        )
         target_sql = ", ".join(quote_ident(c) for c in target)
         update_cols = [c for c in cols if c not in target]
         if resolution == "ignore-duplicates" or not update_cols:
@@ -255,11 +299,22 @@ def build_insert_sql(
     return sql, params
 
 
-def _window_clause(ti: TableInfo, qp: ParsedQuery) -> tuple[str, list]:
+def _window_clause(ti: TableInfo, qp: ParsedQuery, has_limit: bool, has_offset: bool) -> tuple[str, list]:
     """A ``WHERE ctid IN (…)`` fragment windowing a write to the ordered/limited
-    row set — how PostgREST implements limited UPDATE/DELETE."""
-    inner = f"SELECT ctid FROM {ti.ident} {qp.where_sql} {qp.order_sql} {qp.limit_sql}"
-    return f"WHERE ctid IN ({inner})", qp.where_params + qp.limit_params
+    row set — how PostgREST implements limited UPDATE/DELETE.
+
+    Only the EXPLICIT client limit/offset participate: qp always carries a
+    default limit, and dragging it in would silently cap an offset-only write.
+    """
+    inner = f"SELECT ctid FROM {ti.ident} {qp.where_sql} {qp.order_sql}"
+    params = list(qp.where_params)
+    if has_limit:
+        inner += " LIMIT %s"
+        params.append(qp.limit)
+    if has_offset:
+        inner += " OFFSET %s"
+        params.append(qp.offset)
+    return f"WHERE ctid IN ({inner})", params
 
 
 def build_update_sql(
@@ -267,10 +322,11 @@ def build_update_sql(
     body: dict,
     qp: ParsedQuery,
     returning: str | None,
-    windowed: bool = False,
+    window: tuple[bool, bool] | None = None,
 ) -> tuple[str, list]:
     """Assemble ``UPDATE … SET … [WHERE …]`` from a column:value body + parsed
-    filters. ``windowed=True`` applies ?order/?limit/?offset via a ctid subquery."""
+    filters. ``window=(has_limit, has_offset)`` applies the client's explicit
+    ?limit/?offset (with ?order) via a ctid subquery."""
     if not body:
         json_error("bad_request", "PATCH body must contain at least one column.", 400)
     set_parts: list[str] = []
@@ -279,8 +335,8 @@ def build_update_sql(
         _known_column(ti, key, "the update body")
         set_parts.append(f"{quote_ident(key)} = %s")
         params.append(_adapt(value, ti.data_types.get(key)))
-    if windowed:
-        where_sql, where_params = _window_clause(ti, qp)
+    if window:
+        where_sql, where_params = _window_clause(ti, qp, *window)
     else:
         where_sql, where_params = qp.where_sql, list(qp.where_params)
     sql = f"UPDATE {ti.ident} SET {', '.join(set_parts)} {where_sql}"
@@ -294,12 +350,12 @@ def build_delete_sql(
     ti: TableInfo,
     qp: ParsedQuery,
     returning: str | None,
-    windowed: bool = False,
+    window: tuple[bool, bool] | None = None,
 ) -> tuple[str, list]:
-    """Assemble ``DELETE FROM … [WHERE …]`` from parsed filters. ``windowed=True``
-    applies ?order/?limit/?offset via a ctid subquery."""
-    if windowed:
-        where_sql, params = _window_clause(ti, qp)
+    """Assemble ``DELETE FROM … [WHERE …]`` from parsed filters. ``window``
+    applies the client's explicit ?limit/?offset via a ctid subquery."""
+    if window:
+        where_sql, params = _window_clause(ti, qp, *window)
     else:
         where_sql, params = qp.where_sql, list(qp.where_params)
     sql = f"DELETE FROM {ti.ident} {where_sql}"
@@ -324,13 +380,15 @@ def _single_object(rows: list[dict]):
     return rows[0]
 
 
-def _windowed(request: Request) -> bool:
-    """True when the client explicitly limited a write (?limit/?offset).
+def _write_window(request: Request) -> tuple[bool, bool] | None:
+    """The client's explicit write window as ``(has_limit, has_offset)``.
 
-    parse_query always fills a default limit, which must NOT window an
-    unqualified bulk write — only an explicit client limit does.
+    None when neither param is present — parse_query always fills a default
+    limit, which must NOT window an unqualified bulk write.
     """
-    return "limit" in request.query_params or "offset" in request.query_params
+    has_limit = "limit" in request.query_params
+    has_offset = "offset" in request.query_params
+    return (has_limit, has_offset) if (has_limit or has_offset) else None
 
 
 def _get_core(auth, request: Request, response: Response, table: str):
@@ -339,7 +397,7 @@ def _get_core(auth, request: Request, response: Response, table: str):
     _check_known_keys(request.query_params, ti.spec)
     qp = parse_query(request.query_params, ti.spec, reserved=_RESERVED)
     sql = f"SELECT {qp.select_list} FROM {ti.ident} {qp.where_sql} {qp.order_sql} {qp.limit_sql}"
-    rows = db_query(auth.conn, sql, qp.where_params + qp.limit_params)
+    rows = _encode_rows(db_query(auth.conn, sql, qp.where_params + qp.limit_params))
     total = resolve_total(auth.conn, wants_count(request), ti.ident, qp.where_sql, qp.where_params)
     response.headers["Content-Range"] = content_range(qp.offset, len(rows), total)
     return rows
@@ -348,14 +406,16 @@ def _get_core(auth, request: Request, response: Response, table: str):
 def _insert_core(auth, request: Request, table: str, body) -> tuple[list[dict] | None, int]:
     """Shared insert/upsert path. Returns ``(rows|None, affected)`` — rows only
     when ``Prefer: return=representation``."""
-    ti = resolve_table(auth.conn, table)
+    ti = resolve_table(auth.conn, table, include_pk=True)
     _check_insert_keys(request.query_params)
     items, _ = as_items(body)
     representation = wants_return(request) == "representation"
     if not items:
         return ([] if representation else None), 0
 
-    qp = parse_query(request.query_params, ti.spec, reserved=_RESERVED)  # select list for RETURNING
+    # select list for RETURNING; control params reserved so a column named
+    # 'columns'/'on_conflict' can't shadow them.
+    qp = parse_query(request.query_params, ti.spec, reserved=_INSERT_RESERVED)
     sql, params = build_insert_sql(
         ti,
         items,
@@ -365,7 +425,7 @@ def _insert_core(auth, request: Request, table: str, body) -> tuple[list[dict] |
         qp.select_list if representation else None,
     )
     if representation:
-        rows = db_query(auth.conn, sql, params)
+        rows = _encode_rows(db_query(auth.conn, sql, params))
         return rows, len(rows)
     return None, db_exec(auth.conn, sql, params)
 
@@ -379,10 +439,10 @@ def _update_core(auth, request: Request, table: str, body) -> tuple[list[dict] |
     qp = parse_query(request.query_params, ti.spec, reserved=_RESERVED)
     representation = wants_return(request) == "representation"
     sql, params = build_update_sql(
-        ti, body, qp, qp.select_list if representation else None, windowed=_windowed(request)
+        ti, body, qp, qp.select_list if representation else None, window=_write_window(request)
     )
     if representation:
-        rows = db_query(auth.conn, sql, params)
+        rows = _encode_rows(db_query(auth.conn, sql, params))
         return rows, len(rows)
     return None, db_exec(auth.conn, sql, params)
 
@@ -393,9 +453,9 @@ def _delete_core(auth, request: Request, table: str) -> tuple[list[dict] | None,
     _check_known_keys(request.query_params, ti.spec)
     qp = parse_query(request.query_params, ti.spec, reserved=_RESERVED)
     representation = wants_return(request) == "representation"
-    sql, params = build_delete_sql(ti, qp, qp.select_list if representation else None, windowed=_windowed(request))
+    sql, params = build_delete_sql(ti, qp, qp.select_list if representation else None, window=_write_window(request))
     if representation:
-        rows = db_query(auth.conn, sql, params)
+        rows = _encode_rows(db_query(auth.conn, sql, params))
         return rows, len(rows)
     return None, db_exec(auth.conn, sql, params)
 
@@ -478,9 +538,7 @@ async def rest_insert(table: str, auth: Auth, request: Request):
     try:
         body = await _read_json(request)
         payload, _ = _shape_write(auth, request, lambda: _insert_core(auth, request, table, body))
-        if payload is None:
-            return Response(status_code=201)
-        return JSONResponse(status_code=201, content=_jsonable(payload))
+        return Response(status_code=201) if payload is None else payload
     except _PGRST_ERRORS as exc:
         return _pgrst_error(exc)
 

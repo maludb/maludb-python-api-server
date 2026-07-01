@@ -40,7 +40,8 @@ router runs and use the house error envelope on both mounts.
   `or=(…)` / `and=(…)` groups
 - Projection: `?select=col,alias:col,*`
 - Ordering: `?order=col.desc.nullslast,…`
-- Pagination: `limit` / `offset` (default and max **1000** rows)
+- Pagination: `limit` / `offset` (default and max **1000** rows; an over-max
+  `limit` is clamped, matching Supabase's `max-rows`)
 - Counts: `Prefer: count=exact|planned|estimated` → total in `Content-Range`
 - `.single()`: `Accept: application/vnd.pgrst.object+json` returns one object
   (406 `PGRST116` unless exactly one row) — `/rest/v1` only
@@ -69,6 +70,15 @@ arrays → `jsonb` for json/jsonb columns and native Postgres arrays otherwise.
 Filter values on numeric columns pass through as text so `numeric` comparisons
 keep full precision. Writes demanded as `.single()` run the statement and the
 cardinality check in one transaction, so a `406` mismatch rolls the write back.
+`bytea` values are returned as PostgREST-style hex strings (`\x…`). A bulk
+merge-duplicates upsert requires every item to carry the same keys (PostgREST
+behavior) — otherwise a missing key would overwrite the stored value with the
+column default.
+
+**Known divergence:** `numeric` values in *responses* are serialized through
+Python floats and lose precision past ~15 significant digits (PostgREST emits
+the exact digits, though JavaScript clients lose them in `JSON.parse` anyway).
+Filters are unaffected.
 
 ## Strictness (deliberate divergence from the memory routers)
 
