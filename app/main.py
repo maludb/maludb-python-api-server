@@ -39,6 +39,7 @@ from app.routers import (
     objects,
     pools,
     projects,
+    rest,
     skills,
     statements,
     subjects,
@@ -72,6 +73,8 @@ app.include_router(notes.router)
 app.include_router(objects.router)
 app.include_router(pools.router)
 app.include_router(projects.router)
+app.include_router(rest.router_rest)
+app.include_router(rest.router_tables)
 app.include_router(skills.router)
 app.include_router(statements.router)
 app.include_router(subjects.router)

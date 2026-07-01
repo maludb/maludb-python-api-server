@@ -1,7 +1,7 @@
 # Supabase REST-API Parity Plan
 
 **Date:** 2026-06-27
-**Status:** Phase 0, Phase 1 (read-path + counts), and Phase 2 (bulk on facades) landed; RLS deferred. **See "2026-07-01 scope pivot" below — the next phase targets user-created application tables via a generic reflective router.**
+**Status:** Phase 0, Phase 1 (read-path + counts), and Phase 2 (bulk on facades) landed; RLS deferred. The 2026-07-01 scope pivot (user application tables via a generic reflective router) is **built** — see "2026-07-01 build" below.
 **Author:** gap analysis + plan
 
 ## 2026-07-01 — Scope pivot: user application tables (handoff notes)
@@ -58,16 +58,48 @@ scoped to user tables:
 4. **Later** — array/JSON operators (`cs/cd/ov`, `data->>f`), FK-reflected
    resource embedding, `/rpc/{function}`.
 
-### Open decisions (asked, not yet answered)
+### Open decisions — ANSWERED by user 2026-07-01
 
-1. **Wire compat:** full PostgREST/Supabase-SDK compatibility at
-   `/rest/v1/{table}` (bare-array responses, PostgREST error shape — lets
-   supabase-js/py point at MaluDB) vs. house-style `/v1/tables/{table}` with
-   the `{"error":{code,message}}` envelope. Recommendation: full compat.
-2. **Prior memory-router parity work:** keep (it's merged with this commit) —
-   but confirm the user still wants it exposed.
-3. **Table scope:** tenant schema only (recommended) vs. also `public`
-   (cross-tenant shared — hazardous) vs. also user-created views (read-only).
+1. **Wire compat: BOTH.** One implementation, two mounts — full PostgREST
+   compat at `/rest/v1/{table}` (bare arrays, PostgREST error shape, supabase
+   SDKs work unchanged) **and** house-style `/v1/tables/{table}` (envelopes,
+   standard error shape).
+2. **Prior memory-router parity work: keep**, exposed as-is.
+3. **Table scope: tenant schema only** (base tables; `maludb_*`/`malu$*`
+   rejected). `public` and user views excluded for now.
+
+### 2026-07-01 build (branch `feat/rest-user-tables`)
+
+Implemented per the architecture above:
+
+- `app/helpers/reflect.py` — per-request catalog reflection (`resolve_table`):
+  base tables in `current_schema()` only, type-mapped columns, PK discovery,
+  builds the `QuerySpec`. No cache — DDL is visible immediately.
+- `app/routers/rest.py` — the generic router on both mounts. Read path reuses
+  `parse_query` (+ new `select=*` wildcard support in `query.py`, which
+  supabase clients send by default); counts + `Content-Range`; single-object
+  `Accept: application/vnd.pgrst.object+json` (406 `PGRST116` mismatch). Write
+  path: bulk insert (union-of-keys, missing → `DEFAULT`), `?columns=` (accepts
+  PostgREST-quoted names — supabase-py sends `columns="a","b"`), upsert via
+  `Prefer: resolution=` + `?on_conflict=` (default PK), filtered PATCH/DELETE,
+  `Prefer: return=representation|minimal`. **Strict unknown-key rejection**
+  (400) — deliberate divergence from the lenient memory routers, because an
+  ignored typo'd filter on DELETE would nuke the table; `debug` stays allowed.
+  PostgREST error bodies on `/rest/v1` (SQLSTATE as `code`; `PGRST205`/`204`/
+  `116`/`100` for app errors); global house handlers on `/v1/tables`.
+- Docs: `docs/rest-user-tables.md`.
+- Tests: `tests/test_rest.py` (builders, strict keys, `select=*`, registration)
+  + `tests/test_rest_e2e.py` — a real-DB end-to-end suite gated on
+  `MALUDB_E2E_TOKEN`/`MALUDB_E2E_DSN` (closes the "e2e never exercised" gap).
+- **Verified 2026-07-01 on this server** (local Postgres, maludb_core 0.100.0,
+  tenant `app`): 459 unit tests + 12 e2e tests pass; the real `supabase-py`
+  v2.31 client passes a full CRUD/upsert/count/single()/or_() script against
+  `/rest/v1`, including PostgREST-shaped error surfacing (23505 → client
+  `APIError.code`).
+
+Known gaps (explicit 400s, documented): resource embedding, `/rpc`, JSON-path
+and array operators, `Range` headers, CSV, `PUT` upsert. Auth failures use the
+house error shape even on `/rest/v1` (dependency runs before the router).
 
 ## Progress
 

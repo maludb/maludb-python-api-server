@@ -19,7 +19,7 @@ Supported grammar (a pragmatic subset of PostgREST):
                 negation              ?col=not.op.value
                 repeated (AND)        ?age=gte.18&age=lte.65
                 OR groups             ?or=(col.op.value,col.op.value)
-    selection   ?select=col,alias:col
+    selection   ?select=col,alias:col,*
     ordering    ?order=col[.asc|.desc][.nullsfirst|.nullslast],...
     pagination  ?limit=N&offset=M
 
@@ -318,6 +318,13 @@ def _build_select(value: str, spec: QuerySpec) -> tuple[str, list[str]]:
     for item in value.split(","):
         item = item.strip()
         if not item:
+            continue
+        if item == "*":
+            # PostgREST wildcard — every spec column (supabase clients send
+            # ?select=* by default).
+            for name, col in spec.columns.items():
+                pieces.append(f"{col.expr} AS {name}")
+                selected.append(name)
             continue
         if ":" in item:
             alias, name = item.split(":", 1)
