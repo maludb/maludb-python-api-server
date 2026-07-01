@@ -54,8 +54,8 @@ class TestDefaults:
 
     def test_default_select_is_all_columns_in_order(self):
         r = run("")
-        assert r.select_list.startswith("s.subject_id AS id, s.canonical_name AS label")
-        assert "AS linked" in r.select_list
+        assert r.select_list.startswith('s.subject_id AS "id", s.canonical_name AS "label"')
+        assert 'AS "linked"' in r.select_list
         assert r.selected[0] == "id"
 
     def test_limit_over_max_raises_422(self):
@@ -231,12 +231,12 @@ class TestOrGroups:
 class TestSelect:
     def test_select_subset(self):
         r = run("select=id,label")
-        assert r.select_list == "s.subject_id AS id, s.canonical_name AS label"
+        assert r.select_list == 's.subject_id AS "id", s.canonical_name AS "label"'
         assert r.selected == ["id", "label"]
 
     def test_select_alias(self):
         r = run("select=name:label")
-        assert r.select_list == "s.canonical_name AS name"
+        assert r.select_list == 's.canonical_name AS "name"'
         assert r.selected == ["name"]
 
     def test_select_unknown_column_raises(self):

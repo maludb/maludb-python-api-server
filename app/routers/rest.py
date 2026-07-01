@@ -27,12 +27,16 @@ Supported surface:
     POST      single object or bulk array; ?columns=; upsert via
               Prefer: resolution=merge-duplicates|ignore-duplicates
               (+ ?on_conflict=, default: primary key); Prefer: return=
-    PATCH     body = column:value object; filtered by the same grammar
-    DELETE    filtered by the same grammar
+    PATCH     body = column:value object; filtered by the same grammar;
+              ?order/?limit/?offset window the affected rows (ctid subquery)
+    DELETE    filtered by the same grammar; windowed like PATCH
 
 Unknown query-param keys are **rejected** (400) rather than ignored — on a
 generic write surface, a typo'd filter (``?idd=eq.5``) silently matching every
-row would be a data-loss footgun. (``debug`` stays allowed for the SQL trace.)
+row would be a data-loss footgun. For the same reason POST rejects filter
+params outright (they don't apply to inserts), and ``debug`` is reserved for
+the SQL trace on every method (a column literally named ``debug`` is still
+filterable through an ``and=()`` group).
 
 Not implemented (documented gaps): resource embedding (``select=rel(*)``),
 ``/rpc/{fn}``, JSON-path operators, array operators (cs/cd/ov), ``Range``
@@ -91,12 +95,27 @@ def wants_object(request: Request) -> bool:
     return _OBJECT_ACCEPT in request.headers.get("accept", "")
 
 
+async def _read_json(request: Request):
+    """Parse the request body, mapping malformed/empty JSON to a clean 400
+    (PostgREST behavior) instead of leaking a JSONDecodeError 500."""
+    try:
+        return await request.json()
+    except Exception:  # noqa: BLE001 — any body-parse failure is the client's
+        json_error("validation_failed", "Empty or invalid JSON body.", 400)
+
+
 # ---------------------------------------------------------------------------
 # Strict query-key validation
 # ---------------------------------------------------------------------------
 
-# Keys the grammar itself consumes, plus `debug` (the ?debug=1 SQL trace).
+# Keys the read grammar consumes, plus `debug` (the ?debug=1 SQL trace).
+# `debug` is also passed to parse_query as reserved= so a tenant column named
+# `debug` can never turn the trace flag into a silent filter.
 _GRAMMAR_KEYS = frozenset({"select", "order", "limit", "offset", "or", "and", "debug"})
+_RESERVED = ("debug",)
+
+# POST is not a filtered operation: only these keys are meaningful.
+_INSERT_KEYS = frozenset({"select", "columns", "on_conflict", "debug"})
 
 
 def _check_known_keys(query_params, spec, extra: frozenset[str] = frozenset()) -> None:
@@ -106,6 +125,18 @@ def _check_known_keys(query_params, spec, extra: frozenset[str] = frozenset()) -
             continue
         if key not in spec.columns:
             json_error("unknown_column", f"Unknown query parameter or column '{key}'.", 400)
+
+
+def _check_insert_keys(query_params) -> None:
+    """POST allows no filter/order/pagination params — reject them explicitly
+    rather than parse-and-ignore (the same footgun class strict checking closes)."""
+    for key in query_params.keys():
+        if key not in _INSERT_KEYS:
+            json_error(
+                "unknown_column",
+                f"Query parameter '{key}' is not allowed on insert (only 'select', 'columns' and 'on_conflict' apply).",
+                400,
+            )
 
 
 def _known_column(ti: TableInfo, name: str, where: str) -> str:
@@ -128,9 +159,16 @@ def _unquote(name: str) -> str:
     return name
 
 
-def _adapt(value):
-    """Bind dict/list values as jsonb so JSON columns accept object bodies."""
-    if isinstance(value, (dict, list)):
+def _adapt(value, data_type: str | None):
+    """Bind a JSON body value for the column's reflected type.
+
+    dicts are always jsonb; lists are jsonb only for json/jsonb columns —
+    for anything else (notably ARRAY columns) psycopg's native list→array
+    adaptation is what Postgres expects.
+    """
+    if isinstance(value, dict):
+        return Jsonb(value)
+    if isinstance(value, list) and data_type in ("json", "jsonb"):
         return Jsonb(value)
     return value
 
@@ -182,7 +220,7 @@ def build_insert_sql(
             for c in cols:
                 if c in item:
                     placeholders.append("%s")
-                    params.append(_adapt(item[c]))
+                    params.append(_adapt(item[c], ti.data_types.get(c)))
                 else:
                     placeholders.append("DEFAULT")
             value_rows.append("(" + ", ".join(placeholders) + ")")
@@ -217,8 +255,22 @@ def build_insert_sql(
     return sql, params
 
 
-def build_update_sql(ti: TableInfo, body: dict, qp: ParsedQuery, returning: str | None) -> tuple[str, list]:
-    """Assemble ``UPDATE … SET … [WHERE …]`` from a column:value body + parsed filters."""
+def _window_clause(ti: TableInfo, qp: ParsedQuery) -> tuple[str, list]:
+    """A ``WHERE ctid IN (…)`` fragment windowing a write to the ordered/limited
+    row set — how PostgREST implements limited UPDATE/DELETE."""
+    inner = f"SELECT ctid FROM {ti.ident} {qp.where_sql} {qp.order_sql} {qp.limit_sql}"
+    return f"WHERE ctid IN ({inner})", qp.where_params + qp.limit_params
+
+
+def build_update_sql(
+    ti: TableInfo,
+    body: dict,
+    qp: ParsedQuery,
+    returning: str | None,
+    windowed: bool = False,
+) -> tuple[str, list]:
+    """Assemble ``UPDATE … SET … [WHERE …]`` from a column:value body + parsed
+    filters. ``windowed=True`` applies ?order/?limit/?offset via a ctid subquery."""
     if not body:
         json_error("bad_request", "PATCH body must contain at least one column.", 400)
     set_parts: list[str] = []
@@ -226,20 +278,34 @@ def build_update_sql(ti: TableInfo, body: dict, qp: ParsedQuery, returning: str 
     for key, value in body.items():
         _known_column(ti, key, "the update body")
         set_parts.append(f"{quote_ident(key)} = %s")
-        params.append(_adapt(value))
-    sql = f"UPDATE {ti.ident} SET {', '.join(set_parts)} {qp.where_sql}"
-    params.extend(qp.where_params)
+        params.append(_adapt(value, ti.data_types.get(key)))
+    if windowed:
+        where_sql, where_params = _window_clause(ti, qp)
+    else:
+        where_sql, where_params = qp.where_sql, list(qp.where_params)
+    sql = f"UPDATE {ti.ident} SET {', '.join(set_parts)} {where_sql}"
+    params.extend(where_params)
     if returning:
         sql += f" RETURNING {returning}"
     return sql, params
 
 
-def build_delete_sql(ti: TableInfo, qp: ParsedQuery, returning: str | None) -> tuple[str, list]:
-    """Assemble ``DELETE FROM … [WHERE …]`` from parsed filters."""
-    sql = f"DELETE FROM {ti.ident} {qp.where_sql}"
+def build_delete_sql(
+    ti: TableInfo,
+    qp: ParsedQuery,
+    returning: str | None,
+    windowed: bool = False,
+) -> tuple[str, list]:
+    """Assemble ``DELETE FROM … [WHERE …]`` from parsed filters. ``windowed=True``
+    applies ?order/?limit/?offset via a ctid subquery."""
+    if windowed:
+        where_sql, params = _window_clause(ti, qp)
+    else:
+        where_sql, params = qp.where_sql, list(qp.where_params)
+    sql = f"DELETE FROM {ti.ident} {where_sql}"
     if returning:
         sql += f" RETURNING {returning}"
-    return sql, list(qp.where_params)
+    return sql, params
 
 
 # ---------------------------------------------------------------------------
@@ -247,7 +313,7 @@ def build_delete_sql(ti: TableInfo, qp: ParsedQuery, returning: str | None) -> t
 # ---------------------------------------------------------------------------
 
 
-def _single_object(request: Request, rows: list[dict]):
+def _single_object(rows: list[dict]):
     """Apply the ``.single()`` Accept header: exactly one row or 406."""
     if len(rows) != 1:
         json_error(
@@ -258,11 +324,20 @@ def _single_object(request: Request, rows: list[dict]):
     return rows[0]
 
 
+def _windowed(request: Request) -> bool:
+    """True when the client explicitly limited a write (?limit/?offset).
+
+    parse_query always fills a default limit, which must NOT window an
+    unqualified bulk write — only an explicit client limit does.
+    """
+    return "limit" in request.query_params or "offset" in request.query_params
+
+
 def _get_core(auth, request: Request, response: Response, table: str):
     """Shared read path: reflect, parse, select, count. Returns the row list."""
     ti = resolve_table(auth.conn, table)
     _check_known_keys(request.query_params, ti.spec)
-    qp = parse_query(request.query_params, ti.spec)
+    qp = parse_query(request.query_params, ti.spec, reserved=_RESERVED)
     sql = f"SELECT {qp.select_list} FROM {ti.ident} {qp.where_sql} {qp.order_sql} {qp.limit_sql}"
     rows = db_query(auth.conn, sql, qp.where_params + qp.limit_params)
     total = resolve_total(auth.conn, wants_count(request), ti.ident, qp.where_sql, qp.where_params)
@@ -270,17 +345,17 @@ def _get_core(auth, request: Request, response: Response, table: str):
     return rows
 
 
-async def _insert_core(auth, request: Request, table: str) -> tuple[list[dict] | None, int]:
+def _insert_core(auth, request: Request, table: str, body) -> tuple[list[dict] | None, int]:
     """Shared insert/upsert path. Returns ``(rows|None, affected)`` — rows only
     when ``Prefer: return=representation``."""
     ti = resolve_table(auth.conn, table)
-    _check_known_keys(request.query_params, ti.spec, frozenset({"columns", "on_conflict"}))
-    items, _ = as_items(await request.json())
+    _check_insert_keys(request.query_params)
+    items, _ = as_items(body)
     representation = wants_return(request) == "representation"
     if not items:
         return ([] if representation else None), 0
 
-    qp = parse_query(request.query_params, ti.spec)  # select list for RETURNING
+    qp = parse_query(request.query_params, ti.spec, reserved=_RESERVED)  # select list for RETURNING
     sql, params = build_insert_sql(
         ti,
         items,
@@ -295,16 +370,17 @@ async def _insert_core(auth, request: Request, table: str) -> tuple[list[dict] |
     return None, db_exec(auth.conn, sql, params)
 
 
-async def _update_core(auth, request: Request, table: str) -> tuple[list[dict] | None, int]:
+def _update_core(auth, request: Request, table: str, body) -> tuple[list[dict] | None, int]:
     """Shared update path. Returns ``(rows|None, affected)``."""
     ti = resolve_table(auth.conn, table)
     _check_known_keys(request.query_params, ti.spec)
-    body = await request.json()
     if not isinstance(body, dict):
         json_error("validation_failed", "PATCH body must be a JSON object of column:value pairs.", 422)
-    qp = parse_query(request.query_params, ti.spec)
+    qp = parse_query(request.query_params, ti.spec, reserved=_RESERVED)
     representation = wants_return(request) == "representation"
-    sql, params = build_update_sql(ti, body, qp, qp.select_list if representation else None)
+    sql, params = build_update_sql(
+        ti, body, qp, qp.select_list if representation else None, windowed=_windowed(request)
+    )
     if representation:
         rows = db_query(auth.conn, sql, params)
         return rows, len(rows)
@@ -315,9 +391,9 @@ def _delete_core(auth, request: Request, table: str) -> tuple[list[dict] | None,
     """Shared delete path. Returns ``(rows|None, affected)``."""
     ti = resolve_table(auth.conn, table)
     _check_known_keys(request.query_params, ti.spec)
-    qp = parse_query(request.query_params, ti.spec)
+    qp = parse_query(request.query_params, ti.spec, reserved=_RESERVED)
     representation = wants_return(request) == "representation"
-    sql, params = build_delete_sql(ti, qp, qp.select_list if representation else None)
+    sql, params = build_delete_sql(ti, qp, qp.select_list if representation else None, windowed=_windowed(request))
     if representation:
         rows = db_query(auth.conn, sql, params)
         return rows, len(rows)
@@ -367,6 +443,22 @@ def _pgrst_error(exc: Exception) -> JSONResponse:
 _PGRST_ERRORS = (APIError, psycopg.errors.DatabaseError)
 
 
+def _shape_write(auth, request: Request, run_core):
+    """Run a write core, applying the ``.single()`` object contract.
+
+    When the client demands a single object, the write and the cardinality
+    check run in ONE transaction so a 406 mismatch rolls the write back —
+    matching PostgREST, where an errored request never persists. ``run_core``
+    is a no-arg callable returning ``(rows|None, affected)``.
+    """
+    if wants_object(request) and wants_return(request) == "representation":
+        with auth.conn.transaction():
+            rows, affected = run_core()
+            return _single_object(rows), affected
+    rows, affected = run_core()
+    return rows, affected
+
+
 # ---------------------------------------------------------------------------
 # /rest/v1 — PostgREST wire-compatible mount
 # ---------------------------------------------------------------------------
@@ -376,7 +468,7 @@ _PGRST_ERRORS = (APIError, psycopg.errors.DatabaseError)
 def rest_select(table: str, auth: Auth, request: Request, response: Response):
     try:
         rows = _get_core(auth, request, response, table)
-        return _single_object(request, rows) if wants_object(request) else rows
+        return _single_object(rows) if wants_object(request) else rows
     except _PGRST_ERRORS as exc:
         return _pgrst_error(exc)
 
@@ -384,11 +476,11 @@ def rest_select(table: str, auth: Auth, request: Request, response: Response):
 @router_rest.post("/{table}", status_code=201)
 async def rest_insert(table: str, auth: Auth, request: Request):
     try:
-        rows, _ = await _insert_core(auth, request, table)
-        if rows is None:
+        body = await _read_json(request)
+        payload, _ = _shape_write(auth, request, lambda: _insert_core(auth, request, table, body))
+        if payload is None:
             return Response(status_code=201)
-        body = _single_object(request, rows) if wants_object(request) else rows
-        return JSONResponse(status_code=201, content=_jsonable(body))
+        return JSONResponse(status_code=201, content=_jsonable(payload))
     except _PGRST_ERRORS as exc:
         return _pgrst_error(exc)
 
@@ -396,10 +488,9 @@ async def rest_insert(table: str, auth: Auth, request: Request):
 @router_rest.patch("/{table}")
 async def rest_update(table: str, auth: Auth, request: Request):
     try:
-        rows, _ = await _update_core(auth, request, table)
-        if rows is None:
-            return Response(status_code=204)
-        return _single_object(request, rows) if wants_object(request) else rows
+        body = await _read_json(request)
+        payload, _ = _shape_write(auth, request, lambda: _update_core(auth, request, table, body))
+        return Response(status_code=204) if payload is None else payload
     except _PGRST_ERRORS as exc:
         return _pgrst_error(exc)
 
@@ -407,10 +498,8 @@ async def rest_update(table: str, auth: Auth, request: Request):
 @router_rest.delete("/{table}")
 def rest_delete(table: str, auth: Auth, request: Request):
     try:
-        rows, _ = _delete_core(auth, request, table)
-        if rows is None:
-            return Response(status_code=204)
-        return _single_object(request, rows) if wants_object(request) else rows
+        payload, _ = _shape_write(auth, request, lambda: _delete_core(auth, request, table))
+        return Response(status_code=204) if payload is None else payload
     except _PGRST_ERRORS as exc:
         return _pgrst_error(exc)
 
@@ -427,13 +516,13 @@ def tables_select(table: str, auth: Auth, request: Request, response: Response):
 
 @router_tables.post("/{table}", status_code=201)
 async def tables_insert(table: str, auth: Auth, request: Request):
-    rows, affected = await _insert_core(auth, request, table)
+    rows, affected = _insert_core(auth, request, table, await _read_json(request))
     return {"inserted": affected} if rows is None else {"rows": rows}
 
 
 @router_tables.patch("/{table}")
 async def tables_update(table: str, auth: Auth, request: Request):
-    rows, affected = await _update_core(auth, request, table)
+    rows, affected = _update_core(auth, request, table, await _read_json(request))
     return {"updated": affected} if rows is None else {"rows": rows}
 
 

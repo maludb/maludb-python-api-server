@@ -101,6 +101,35 @@ Known gaps (explicit 400s, documented): resource embedding, `/rpc`, JSON-path
 and array operators, `Range` headers, CSV, `PUT` upsert. Auth failures use the
 house error shape even on `/rest/v1` (dependency runs before the router).
 
+### Code review of the generic router (high effort, 2026-07-01)
+
+A workflow-backed review found 10 defects, all fixed the same day:
+1. **?limit/?order silently dropped on PATCH/DELETE** → implemented PostgREST's
+   limited update/delete (`WHERE ctid IN (SELECT ctid … ORDER … LIMIT …)`),
+   triggered only by an explicit client `limit`/`offset`.
+2. **.single() 406 after the write committed** (autocommit) → the write and the
+   cardinality check now run in one transaction; mismatch rolls back.
+3. **Unquoted SQL aliases** case-folded camelCase columns / syntax-errored on
+   exotic names → all three select paths in `query.py` quote the alias.
+4. **Lists always bound as Jsonb** broke `ARRAY` columns → `_adapt` binds by
+   the column's reflected `data_type` (jsonb only for json/jsonb).
+5. **numeric filters coerced through float** lost precision → numeric/real/
+   double now pass through as text; Postgres compares at full precision.
+6. **`?debug` collided with a tenant column named `debug`** → `debug` is
+   reserved in every `parse_query` call on this surface.
+7. **`current_schema()` scoping could resolve to a shared schema** for a role
+   without its own schema → reflection scopes on `current_user` (the tenant
+   schema is named after the role — the onboarding contract).
+8. **JSONDecodeError → 500** on malformed bodies → `_read_json` maps any body
+   parse failure to 400 (`PGRST102` on /rest/v1).
+9. **PK reflection included INCLUDE columns** (poisoned default `on_conflict`)
+   → pg_index walk limited to `indnkeyatts`.
+10. **POST silently ignored filter params** → POST now rejects everything but
+    `select`/`columns`/`on_conflict`/`debug`.
+
+Re-verified after the fixes: 468 unit + 19 e2e tests green (new regression
+tests cover every finding), supabase-py compat script passes.
+
 ## Progress
 
 - **Phase 0 — done.** `app/helpers/query.py` (`QuerySpec`/`Col`/`parse_query`/`build_where`) + unit tests in `tests/test_query.py`.

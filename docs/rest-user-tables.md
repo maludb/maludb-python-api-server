@@ -52,20 +52,32 @@ router runs and use the house error envelope on both mounts.
   target `?on_conflict=col,…` (defaults to the primary key)
 - `Prefer: return=representation` echoes the inserted rows (honoring
   `?select=`); default is minimal (`201`, empty body on `/rest/v1`)
+- Filter/order/pagination params are **rejected** on POST — they don't apply
+  to an insert, and parse-and-ignore is the footgun class this API avoids
 
 **Update** — `PATCH /{table}?<filters>` with a `{"col": value}` body
 **Delete** — `DELETE /{table}?<filters>`
 - Both honor `Prefer: return=representation` (else `204` on `/rest/v1`,
   `{"updated"/"deleted": n}` on `/v1/tables`)
+- An explicit `?limit=`/`?offset=` (with optional `?order=`) windows the write
+  to that row set via a `ctid` subquery — PostgREST's limited update/delete
 - An unfiltered PATCH/DELETE affects the whole table (PostgREST parity) — but
   see strictness below
+
+Values bind by the column's reflected type: JSON objects → `jsonb`, JSON
+arrays → `jsonb` for json/jsonb columns and native Postgres arrays otherwise.
+Filter values on numeric columns pass through as text so `numeric` comparisons
+keep full precision. Writes demanded as `.single()` run the statement and the
+cardinality check in one transaction, so a `406` mismatch rolls the write back.
 
 ## Strictness (deliberate divergence from the memory routers)
 
 Unknown query-param keys are **rejected with 400** instead of ignored. On a
 generic write surface, a typo'd filter (`?idd=eq.5`) that was silently ignored
 would turn a targeted DELETE into a full-table DELETE. `debug` remains allowed
-(`?debug=1` SQL trace), plus `columns` / `on_conflict` on POST.
+(`?debug=1` SQL trace) and is reserved on every method — a tenant column named
+`debug` never becomes a silent filter (filter such a column via `and=(…)`).
+`columns` / `on_conflict` are additionally allowed on POST.
 
 ## Error shapes
 

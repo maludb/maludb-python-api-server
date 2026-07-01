@@ -312,6 +312,14 @@ def _build_and_group(raw: str, spec: QuerySpec) -> tuple[str, list]:
 # ---------------------------------------------------------------------------
 
 
+def _quote_alias(name: str) -> str:
+    """Double-quote a SQL output alias. Spec column names may come from catalog
+    reflection (app/helpers/reflect.py) and can be mixed-case or contain any
+    character; unquoted they would case-fold or be a syntax error. Quoting is a
+    no-op for the lowercase identifiers the hand-written routers use."""
+    return '"' + name.replace('"', '""') + '"'
+
+
 def _build_select(value: str, spec: QuerySpec) -> tuple[str, list[str]]:
     pieces: list[str] = []
     selected: list[str] = []
@@ -323,19 +331,19 @@ def _build_select(value: str, spec: QuerySpec) -> tuple[str, list[str]]:
             # PostgREST wildcard — every spec column (supabase clients send
             # ?select=* by default).
             for name, col in spec.columns.items():
-                pieces.append(f"{col.expr} AS {name}")
+                pieces.append(f"{col.expr} AS {_quote_alias(name)}")
                 selected.append(name)
             continue
         if ":" in item:
             alias, name = item.split(":", 1)
         else:
             alias = name = item
-        if not _IDENT_RE.match(alias):
+        if ":" in item and not _IDENT_RE.match(alias):
             raise _bad(f"Invalid column alias '{alias}'.")
         col = spec.columns.get(name)
         if col is None:
             raise _bad(f"Unknown column '{name}' in select.")
-        pieces.append(f"{col.expr} AS {alias}")
+        pieces.append(f"{col.expr} AS {_quote_alias(alias)}")
         selected.append(alias)
     if not pieces:
         raise _bad("Empty select list.")
@@ -344,7 +352,7 @@ def _build_select(value: str, spec: QuerySpec) -> tuple[str, list[str]]:
 
 def _default_select(spec: QuerySpec) -> tuple[str, list[str]]:
     names = spec.default_select if spec.default_select is not None else list(spec.columns.keys())
-    pieces = [f"{spec.columns[n].expr} AS {n}" for n in names]
+    pieces = [f"{spec.columns[n].expr} AS {_quote_alias(n)}" for n in names]
     return ", ".join(pieces), list(names)
 
 

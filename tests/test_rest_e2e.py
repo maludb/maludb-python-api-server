@@ -31,7 +31,7 @@ pytestmark = pytest.mark.skipif(
     reason="e2e disabled — set MALUDB_E2E_TOKEN and MALUDB_E2E_DSN",
 )
 
-TABLE = "maludb_e2e_scratch_todos".replace("maludb_", "e2e_")  # never a reserved prefix
+TABLE = "e2e_scratch_todos"
 
 
 @pytest.fixture(scope="module")
@@ -57,6 +57,9 @@ def scratch_table():
             "  title text NOT NULL,"
             "  done boolean NOT NULL DEFAULT false,"
             "  meta jsonb,"
+            "  tags text[],"
+            '  "dueAt" timestamptz,'
+            "  amount numeric(30, 10),"
             "  UNIQUE (title))"
         )
     yield
@@ -143,6 +146,68 @@ class TestRestFlavorE2E:
         r = client.delete(f"/rest/v1/{TABLE}?title=eq.write docs", headers=REPR)
         assert r.status_code == 200
         assert r.json()[0]["title"] == "write docs"
+
+    # -- regression tests for the 2026-07-01 review findings ---------------
+
+    def test_array_column_roundtrip(self, client):
+        r = client.post(f"/rest/v1/{TABLE}", json={"title": "arrayed", "tags": ["a", "b"]}, headers=REPR)
+        assert r.status_code == 201, r.text
+        assert r.json()[0]["tags"] == ["a", "b"]
+        client.delete(f"/rest/v1/{TABLE}?title=eq.arrayed")
+
+    def test_camelcase_column_key_preserved(self, client):
+        r = client.post(
+            f"/rest/v1/{TABLE}",
+            json={"title": "cased", "dueAt": "2026-07-01T12:00:00Z"},
+            headers=REPR,
+        )
+        assert r.status_code == 201, r.text
+        assert "dueAt" in r.json()[0], r.json()[0]
+        r = client.get(f"/rest/v1/{TABLE}?title=eq.cased&select=*")
+        assert "dueAt" in r.json()[0]
+        client.delete(f"/rest/v1/{TABLE}?title=eq.cased")
+
+    def test_numeric_precision_filter(self, client):
+        big = "12345678901234567890.5"
+        client.post(f"/rest/v1/{TABLE}", json={"title": "precise", "amount": big})
+        r = client.get(f"/rest/v1/{TABLE}?amount=eq.{big}&select=title")
+        assert r.json() == [{"title": "precise"}]
+        client.delete(f"/rest/v1/{TABLE}?title=eq.precise")
+
+    def test_limited_delete_windows(self, client):
+        client.post(
+            f"/rest/v1/{TABLE}",
+            json=[{"title": "win 1"}, {"title": "win 2"}, {"title": "win 3"}],
+        )
+        r = client.delete(f"/rest/v1/{TABLE}?title=like.win *&order=title&limit=1", headers=REPR)
+        assert [x["title"] for x in r.json()] == ["win 1"]
+        r = client.get(f"/rest/v1/{TABLE}?title=like.win *&select=title&order=title")
+        assert [x["title"] for x in r.json()] == ["win 2", "win 3"]
+        client.delete(f"/rest/v1/{TABLE}?title=like.win *")
+
+    def test_single_write_mismatch_rolls_back(self, client):
+        r = client.post(
+            f"/rest/v1/{TABLE}",
+            json=[{"title": "tx 1"}, {"title": "tx 2"}],
+            headers={
+                "Prefer": "return=representation",
+                "Accept": "application/vnd.pgrst.object+json",
+            },
+        )
+        assert r.status_code == 406
+        r = client.get(f"/rest/v1/{TABLE}?title=like.tx *")
+        assert r.json() == []  # nothing persisted — the 406 rolled the insert back
+
+    def test_malformed_json_is_400(self, client):
+        r = client.post(f"/rest/v1/{TABLE}", content='{"title": ', headers={"content-type": "application/json"})
+        assert r.status_code == 400
+        assert r.json()["code"] == "PGRST102"
+
+    def test_post_rejects_filter_params(self, client):
+        r = client.post(f"/rest/v1/{TABLE}?id=eq.5", json={"title": "nope"})
+        assert r.status_code == 400
+        r = client.get(f"/rest/v1/{TABLE}?title=eq.nope")
+        assert r.json() == []
 
 
 class TestTablesFlavorE2E:

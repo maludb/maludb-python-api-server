@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import pytest
 from fastapi.testclient import TestClient
+from psycopg.types.json import Jsonb
 from starlette.datastructures import QueryParams
 
 from app.errors import APIError
@@ -15,6 +16,7 @@ from app.helpers.query import Col, QuerySpec, parse_query
 from app.helpers.reflect import REST_DEFAULT_LIMIT, REST_MAX_LIMIT, TableInfo, quote_ident
 from app.main import app
 from app.routers.rest import (
+    _check_insert_keys,
     _check_known_keys,
     build_delete_sql,
     build_insert_sql,
@@ -30,7 +32,8 @@ client = TestClient(app, raise_server_exceptions=False)
 
 
 def make_table(name: str = "todos", pk: list[str] | None = None) -> TableInfo:
-    columns = {"id": int, "title": str, "done": bool, "meta": str}
+    columns = {"id": int, "title": str, "done": bool, "meta": str, "tags": str}
+    data_types = {"id": "bigint", "title": "text", "done": "boolean", "meta": "jsonb", "tags": "ARRAY"}
     spec = QuerySpec(
         columns={n: Col(quote_ident(n), t) for n, t in columns.items()},
         default_order=[],
@@ -41,6 +44,7 @@ def make_table(name: str = "todos", pk: list[str] | None = None) -> TableInfo:
         name=name,
         ident=quote_ident(name),
         columns=columns,
+        data_types=data_types,
         pk=pk if pk is not None else ["id"],
         spec=spec,
     )
@@ -108,12 +112,21 @@ class TestSelectStar:
     def test_star_expands_all_columns(self):
         ti = make_table()
         qp = parse_query(QueryParams("select=*"), ti.spec)
-        assert qp.selected == ["id", "title", "done", "meta"]
+        assert qp.selected == ["id", "title", "done", "meta", "tags"]
 
     def test_star_mixed_with_alias(self):
         ti = make_table()
         qp = parse_query(QueryParams("select=*,name:title"), ti.spec)
-        assert qp.selected == ["id", "title", "done", "meta", "name"]
+        assert qp.selected == ["id", "title", "done", "meta", "tags", "name"]
+
+    def test_aliases_are_quoted(self):
+        """Reflected column names can be mixed-case or contain spaces — the SQL
+        alias must be quoted or Postgres case-folds / errors."""
+        spec = QuerySpec(columns={"userId": Col('"userId"', int), "user id": Col('"user id"', str)})
+        qp = parse_query(QueryParams("select=*"), spec)
+        assert qp.select_list == '"userId" AS "userId", "user id" AS "user id"'
+        qp = parse_query(QueryParams(""), spec)  # default select
+        assert qp.select_list == '"userId" AS "userId", "user id" AS "user id"'
 
 
 # ---------------------------------------------------------------------------
@@ -223,3 +236,60 @@ class TestBuildUpdateDelete:
         sql, params = build_delete_sql(ti, parsed("", ti), None)
         assert sql == 'DELETE FROM "todos" '
         assert params == []
+
+    def test_windowed_delete_applies_order_and_limit(self):
+        """?limit= on DELETE must window via ctid — never silently over-delete."""
+        ti = make_table()
+        qp = parsed("done=is.true&order=id&limit=1", ti)
+        sql, params = build_delete_sql(ti, qp, None, windowed=True)
+        assert sql == (
+            'DELETE FROM "todos" WHERE ctid IN '
+            '(SELECT ctid FROM "todos" WHERE "done" IS TRUE ORDER BY "id" ASC LIMIT %s)'
+        )
+        assert params == [1]
+
+    def test_windowed_update_param_order(self):
+        ti = make_table()
+        qp = parsed("id=gte.10&limit=2&offset=1", ti)
+        sql, params = build_update_sql(ti, {"done": True}, qp, None, windowed=True)
+        assert sql == (
+            'UPDATE "todos" SET "done" = %s WHERE ctid IN '
+            '(SELECT ctid FROM "todos" WHERE "id" >= %s  LIMIT %s OFFSET %s)'
+        )
+        assert params == [True, 10, 2, 1]
+
+
+# ---------------------------------------------------------------------------
+# Value adaptation + insert-key strictness
+# ---------------------------------------------------------------------------
+
+
+class TestAdaptAndInsertKeys:
+    def test_list_into_array_column_stays_native(self):
+        """A Python list bound to an ARRAY column must use psycopg's native
+        list→array adaptation, not a Jsonb wrapper."""
+        ti = make_table()
+        _, params = build_insert_sql(ti, [{"tags": ["a", "b"]}], None, None, None, None)
+        assert params == [["a", "b"]]
+
+    def test_list_into_jsonb_column_wrapped(self):
+        ti = make_table()
+        _, params = build_insert_sql(ti, [{"meta": [1, 2]}], None, None, None, None)
+        assert isinstance(params[0], Jsonb)
+
+    def test_dict_always_wrapped(self):
+        ti = make_table()
+        _, params = build_insert_sql(ti, [{"meta": {"k": 1}}], None, None, None, None)
+        assert isinstance(params[0], Jsonb)
+
+    def test_insert_rejects_filter_params(self):
+        with pytest.raises(APIError) as exc:
+            _check_insert_keys(QueryParams("id=eq.5"))
+        assert exc.value.status == 400
+
+    def test_insert_rejects_limit(self):
+        with pytest.raises(APIError):
+            _check_insert_keys(QueryParams("limit=5"))
+
+    def test_insert_allows_its_keys(self):
+        _check_insert_keys(QueryParams("select=id&columns=title&on_conflict=id&debug=1"))  # no raise
