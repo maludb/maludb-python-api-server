@@ -24,8 +24,9 @@ Supported grammar (a pragmatic subset of PostgREST):
     pagination  ?limit=N&offset=M
 
 Not yet supported (raise a clear 400 ``bad_request``): array/range operators
-(cs/cd/ov), JSON-path access, quoted values inside ``in.()``/``or()``, and nested
-``and``/``or`` groups.
+(cs/cd/ov and friends), JSON-path access, quoted values inside ``or()``/``and()``
+groups, and nested ``and``/``or`` groups. ``in.()`` accepts PostgREST-quoted
+values (``in.("a,b",c)``).
 
 Malformed values, unknown columns, and unknown operators raise
 ``APIError("bad_request", …, 400)`` so the failure matches the standard JSON error
@@ -128,6 +129,12 @@ _IS_VALUES = {"null", "true", "false", "unknown"}
 # (as ``op.value``) is treated as an implicit ``eq`` exact match — so bare legacy
 # params (``?type=note``) and dotted literals (timestamps) still work.
 _KNOWN_OPS = frozenset(_SIMPLE_OPS) | frozenset(_FTS_OPS) | {"in", "is"}
+
+# PostgREST operators this grammar deliberately does NOT implement. They must
+# fail loudly: falling through to the implicit-eq would compile e.g.
+# ``tags=cs.{a}`` into ``tags = 'cs.{a}'`` — silently matching nothing, which
+# on a DELETE reads as success.
+_UNSUPPORTED_OPS = frozenset({"cs", "cd", "ov", "sl", "sr", "nxr", "nxl", "adj", "all", "any", "isdistinct"})
 # Operators that only make sense on a text column (pattern / regex / full-text).
 _TEXT_OPS = frozenset({"like", "ilike", "match", "imatch"}) | frozenset(_FTS_OPS)
 
@@ -203,6 +210,14 @@ def _parse_op(raw: str) -> tuple[bool, str, str | None, str]:
         lang = m.group(2) if m else None
         return negate, base, lang, value
 
+    # Reject operators PostgREST defines but we don't implement, including
+    # behind an unstripped ``not.`` — implicit-eq would silently match nothing.
+    probe = body[4:] if body.startswith("not.") else body
+    probe_tok = probe.partition(".")[0]
+    pm = _LANG_RE.match(probe_tok)
+    if (pm.group(1) if pm else probe_tok) in _UNSUPPORTED_OPS:
+        raise _bad(f"Operator '{pm.group(1) if pm else probe_tok}' is not supported.")
+
     # No recognized operator prefix → implicit eq over the entire value.
     return negate, "eq", None, body
 
@@ -225,7 +240,7 @@ def _build_condition(api_name: str, col: Col, raw: str) -> tuple[str, list]:
         inner = value.strip()
         if inner.startswith("(") and inner.endswith(")"):
             inner = inner[1:-1]
-        items = [x.strip() for x in inner.split(",") if x.strip() != ""]
+        items = split_quoted_list(inner)
         if not items:
             raise _bad(f"Empty 'in' list for column '{api_name}'.")
         params = [_coerce(api_name, col, x) for x in items]
@@ -254,6 +269,27 @@ def _build_condition(api_name: str, col: Col, raw: str) -> tuple[str, list]:
     if negate:
         frag = f"NOT ({frag})"
     return frag, params
+
+
+# One token of a PostgREST comma-separated list: a double-quoted value (which
+# may contain commas; supabase clients quote any value containing , : ( or ))
+# or a bare value up to the next comma.
+_QUOTED_LIST_TOKEN = re.compile(r'"((?:[^"]|"")*)"|([^,]+)')
+
+
+def split_quoted_list(raw: str) -> list[str]:
+    """Split a PostgREST list (``a,b`` / ``"a,b","c"``), honoring double quotes
+    and unquoting the items. Used for ``in.(…)`` values and, in the user-table
+    router, ``?columns=``/``?on_conflict=`` names."""
+    items: list[str] = []
+    for m in _QUOTED_LIST_TOKEN.finditer(raw):
+        if m.group(1) is not None:
+            items.append(m.group(1).replace('""', '"'))
+        else:
+            token = m.group(2).strip()
+            if token:
+                items.append(token)
+    return items
 
 
 def _split_top(s: str) -> list[str]:
@@ -322,8 +358,12 @@ def quote_ident(name: str) -> str:
     app/helpers/reflect.py. Spec column names may come from catalog reflection
     and can be mixed-case or contain any character; unquoted they would
     case-fold or be a syntax error. Quoting is a no-op for the lowercase
-    identifiers the hand-written routers use."""
-    return '"' + name.replace('"', '""') + '"'
+    identifiers the hand-written routers use.
+
+    ``%`` is doubled for psycopg's client-side placeholder parser: the quoted
+    identifier is spliced into SQL executed with bound params, where a lone
+    ``%`` is a ProgrammingError."""
+    return ('"' + name.replace('"', '""') + '"').replace("%", "%%")
 
 
 _quote_alias = quote_ident
@@ -511,7 +551,13 @@ def build_where(*clauses: str) -> str:
 # Counting + Content-Range (PostgREST-style pagination metadata)
 # ---------------------------------------------------------------------------
 
-_COUNT_RE = re.compile(r"count=(exact|planned|estimated)")
+
+def prefer_token(request, key: str, values: tuple[str, ...]) -> str | None:
+    """Extract one ``key=value`` preference from the ``Prefer:`` header,
+    where ``value`` must be one of ``values``. Shared by count/return/
+    resolution parsing so the header grammar lives in one place."""
+    m = re.search(rf"{key}=({'|'.join(values)})", request.headers.get("prefer", ""))
+    return m.group(1) if m else None
 
 
 def wants_count(request) -> str | None:
@@ -519,8 +565,7 @@ def wants_count(request) -> str | None:
 
     One of ``exact`` / ``planned`` / ``estimated``, or None when absent.
     """
-    m = _COUNT_RE.search(request.headers.get("prefer", ""))
-    return m.group(1) if m else None
+    return prefer_token(request, "count", ("exact", "planned", "estimated"))
 
 
 def content_range(offset: int, returned: int, total: int | None) -> str:

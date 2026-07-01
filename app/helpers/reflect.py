@@ -83,8 +83,8 @@ def resolve_table(conn: psycopg.Connection, table: str, include_pk: bool = False
     maludb_core or public) for a role without its own schema and re-open the
     cross-tenant access the table-scope decision excluded.
 
-    Reflection runs per request (two catalog lookups) so DDL is visible
-    immediately — no cache-staleness window after a CREATE/ALTER TABLE.
+    Reflection runs per request so DDL is visible immediately — no
+    cache-staleness window after a CREATE/ALTER TABLE.
     """
     if not table or table.startswith(_RESERVED_PREFIXES):
         raise table_not_found(table)

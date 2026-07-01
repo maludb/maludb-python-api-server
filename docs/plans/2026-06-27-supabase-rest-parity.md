@@ -73,7 +73,8 @@ scoped to user tables:
 Implemented per the architecture above:
 
 - `app/helpers/reflect.py` — per-request catalog reflection (`resolve_table`):
-  base tables in `current_schema()` only, type-mapped columns, PK discovery,
+  base tables in the tenant role's own schema only (scoped on `current_user` —
+  see review fix #7 below), type-mapped columns, PK discovery,
   builds the `QuerySpec`. No cache — DDL is visible immediately.
 - `app/routers/rest.py` — the generic router on both mounts. Read path reuses
   `parse_query` (+ new `select=*` wildcard support in `query.py`, which
@@ -157,6 +158,36 @@ A second workflow review of the fixed branch found 10 more, all addressed:
 
 Final state: 500 tests green (unit + 25 e2e regression tests), lint/format
 clean on touched files, supabase-py compat script passes.
+
+### Third review round (high effort, 2026-07-01)
+
+Ten more findings, all addressed:
+1. `in.()` did not unquote PostgREST-quoted values (supabase clients quote
+   anything containing `, : ( )`) → shared `split_quoted_list` used for
+   `in.()`, `?columns=`, `?on_conflict=` (also fixes quoted-comma names).
+2. Write windows reused qp's clamped/defaulted limit (`?limit=5000` silently
+   deleted 1000) → `_write_window` parses the raw explicit values; over-max on
+   a write is a 400, empty values count as absent.
+3. Repeated `?debug=eq.true&debug=1` bypassed the debug guard via last-value
+   `get()` → every occurrence checked with `getlist`.
+4. Unsupported PostgREST operators (`cs`/`cd`/`ov`/…) fell through to implicit
+   eq (silently matching nothing) → explicit 400, including behind `not.`.
+5. `%` in reflected identifiers broke psycopg placeholder parsing →
+   `quote_ident` doubles `%`.
+6. Alias-casing wire change on memory endpoints → **accepted** (PostgREST
+   preserves alias case; grammar shipped days ago, no known consumers).
+7. TracerMiddleware injected `meta` into bare-object responses and dropped
+   headers on rebuild → `/rest/` exempted from debug injection; original
+   headers now carried over on the house mounts.
+8. Plan doc still said `current_schema()` in the build summary → corrected.
+9. Prefer-header parsing duplicated across modules → shared
+   `query.prefer_token` used by count/return/resolution.
+10. Copy-pasted try/except on the four /rest handlers → left as-is
+    (deliberate: explicit per-handler guard; a decorator adds indirection for
+    four short handlers, and the sync/async split makes it uglier).
+
+Final state: 508 tests green (incl. 28 real-DB e2e), lint/format clean,
+supabase-py compat verified after each round.
 
 ## Progress
 

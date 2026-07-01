@@ -116,10 +116,14 @@ class TracerMiddleware(BaseHTTPMiddleware):
 
         response = await call_next(request)
 
-        # Debug injection: if DEBUG_ENABLED and ?debug=1, inject meta.debug into JSON responses
+        # Debug injection: if DEBUG_ENABLED and ?debug=1, inject meta.debug into JSON
+        # responses. Never on /rest/v1 — that mount is wire-compatible with PostgREST
+        # (bare arrays / bare row objects), and a phantom "meta" member would be read
+        # by supabase clients as row data (leaking the SQL trace into it).
         if (
             config.DEBUG_ENABLED
             and request.query_params.get("debug") == "1"
+            and not request.url.path.startswith("/rest/")
             and response.headers.get("content-type", "").startswith("application/json")
         ):
             # Read the response body
@@ -140,9 +144,15 @@ class TracerMiddleware(BaseHTTPMiddleware):
                         "endpoint": tracer.endpoint,
                         "queries": tracer.queries,
                     }
+                    # Carry over the original headers (e.g. Content-Range) —
+                    # content-length/type are recomputed for the new body.
+                    headers = {
+                        k: v for k, v in response.headers.items() if k.lower() not in ("content-length", "content-type")
+                    }
                     return JSONResponse(
                         content=data,
                         status_code=response.status_code,
+                        headers=headers,
                     )
             except (json.JSONDecodeError, UnicodeDecodeError):
                 pass

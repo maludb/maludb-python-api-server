@@ -45,8 +45,6 @@ headers, CSV bodies.
 
 from __future__ import annotations
 
-import re
-
 import psycopg
 from fastapi import APIRouter, Request, Response
 from fastapi.responses import JSONResponse
@@ -59,7 +57,9 @@ from app.helpers.query import (
     ParsedQuery,
     content_range,
     parse_query,
+    prefer_token,
     resolve_total,
+    split_quoted_list,
     wants_count,
 )
 from app.helpers.reflect import TableInfo, quote_ident, resolve_table
@@ -73,21 +73,17 @@ router_tables = APIRouter(prefix="/v1/tables", tags=["tables"])
 # Prefer / Accept header parsing
 # ---------------------------------------------------------------------------
 
-_RETURN_RE = re.compile(r"return=(representation|minimal|headers-only)")
-_RESOLUTION_RE = re.compile(r"resolution=(merge-duplicates|ignore-duplicates)")
 _OBJECT_ACCEPT = "application/vnd.pgrst.object+json"
 
 
 def wants_return(request: Request) -> str | None:
     """The ``Prefer: return=…`` preference, or None (PostgREST default: minimal)."""
-    m = _RETURN_RE.search(request.headers.get("prefer", ""))
-    return m.group(1) if m else None
+    return prefer_token(request, "return", ("representation", "minimal", "headers-only"))
 
 
 def wants_resolution(request: Request) -> str | None:
     """The ``Prefer: resolution=…`` upsert preference, or None (plain insert)."""
-    m = _RESOLUTION_RE.search(request.headers.get("prefer", ""))
-    return m.group(1) if m else None
+    return prefer_token(request, "resolution", ("merge-duplicates", "ignore-duplicates"))
 
 
 def wants_object(request: Request) -> bool:
@@ -124,23 +120,25 @@ _INSERT_RESERVED = ("debug", "columns", "on_conflict")
 def _check_debug_value(query_params) -> None:
     """`debug` is reserved for the SQL-trace flag (?debug=1). A filter-shaped
     value (?debug=eq.true on a table with a `debug` column) must NOT be
-    silently dropped — that would unfilter a write. Reject it and point at the
-    and=() group, which reaches the column unambiguously."""
-    value = query_params.get("debug")
-    if value not in (None, "", "0", "1"):
-        json_error(
-            "bad_request",
-            "'debug' is reserved for the SQL trace (?debug=1). "
-            "To filter a column named 'debug', use and=(debug.<op>.<value>).",
-            400,
-        )
+    silently dropped — that would unfilter a write. EVERY occurrence is checked
+    (a repeated ?debug=eq.true&debug=1 must not sneak past on the last value).
+    Reject and point at the and=() group, which reaches the column
+    unambiguously."""
+    for value in query_params.getlist("debug"):
+        if value not in ("", "0", "1"):
+            json_error(
+                "bad_request",
+                "'debug' is reserved for the SQL trace (?debug=1). "
+                "To filter a column named 'debug', use and=(debug.<op>.<value>).",
+                400,
+            )
 
 
-def _check_known_keys(query_params, spec, extra: frozenset[str] = frozenset()) -> None:
+def _check_known_keys(query_params, spec) -> None:
     """Reject query keys that are neither grammar keys nor spec columns."""
     _check_debug_value(query_params)
     for key in query_params.keys():
-        if key in _GRAMMAR_KEYS or key in extra:
+        if key in _GRAMMAR_KEYS:
             continue
         if key not in spec.columns:
             json_error("unknown_column", f"Unknown query parameter or column '{key}'.", 400)
@@ -169,25 +167,6 @@ def _known_column(ti: TableInfo, name: str, where: str) -> str:
 # ---------------------------------------------------------------------------
 # SQL builders (unit-testable, no I/O)
 # ---------------------------------------------------------------------------
-
-
-# One ?columns=/-?on_conflict= token: a PostgREST-quoted name (which may contain
-# commas or doubled quotes) or a bare name up to the next comma.
-_COLUMNS_TOKEN = re.compile(r'"((?:[^"]|"")*)"|([^,]+)')
-
-
-def _split_columns(param: str) -> list[str]:
-    """Split a PostgREST column-list param (``a,b`` or ``"sku","name"``),
-    honoring quotes — a quoted name may itself contain commas."""
-    cols: list[str] = []
-    for m in _COLUMNS_TOKEN.finditer(param):
-        if m.group(1) is not None:
-            cols.append(m.group(1).replace('""', '"'))
-        else:
-            token = m.group(2).strip()
-            if token:
-                cols.append(token)
-    return cols
 
 
 def _adapt(value, data_type: str | None):
@@ -231,7 +210,7 @@ def build_insert_sql(
     are validated against the reflected table and quoted from catalog names.
     """
     if columns_param is not None:
-        cols = _split_columns(columns_param)
+        cols = split_quoted_list(columns_param)
         if not cols:
             json_error("bad_request", "Empty 'columns' list.", 400)
     else:
@@ -265,7 +244,7 @@ def build_insert_sql(
 
     if resolution:
         if on_conflict_param:
-            target = [_known_column(ti, c, "'on_conflict'") for c in _split_columns(on_conflict_param)]
+            target = [_known_column(ti, c, "'on_conflict'") for c in split_quoted_list(on_conflict_param)]
         else:
             target = ti.pk
         if not target:
@@ -299,21 +278,22 @@ def build_insert_sql(
     return sql, params
 
 
-def _window_clause(ti: TableInfo, qp: ParsedQuery, has_limit: bool, has_offset: bool) -> tuple[str, list]:
+def _window_clause(ti: TableInfo, qp: ParsedQuery, limit: int | None, offset: int | None) -> tuple[str, list]:
     """A ``WHERE ctid IN (…)`` fragment windowing a write to the ordered/limited
     row set — how PostgREST implements limited UPDATE/DELETE.
 
-    Only the EXPLICIT client limit/offset participate: qp always carries a
-    default limit, and dragging it in would silently cap an offset-only write.
+    ``limit``/``offset`` are the client's EXPLICIT, validated values (see
+    ``_write_window``) — qp's parsed limit is never used here because it holds
+    a default/clamped value that would silently cap the write.
     """
     inner = f"SELECT ctid FROM {ti.ident} {qp.where_sql} {qp.order_sql}"
     params = list(qp.where_params)
-    if has_limit:
+    if limit is not None:
         inner += " LIMIT %s"
-        params.append(qp.limit)
-    if has_offset:
+        params.append(limit)
+    if offset is not None:
         inner += " OFFSET %s"
-        params.append(qp.offset)
+        params.append(offset)
     return f"WHERE ctid IN ({inner})", params
 
 
@@ -322,11 +302,11 @@ def build_update_sql(
     body: dict,
     qp: ParsedQuery,
     returning: str | None,
-    window: tuple[bool, bool] | None = None,
+    window: tuple[int | None, int | None] | None = None,
 ) -> tuple[str, list]:
     """Assemble ``UPDATE … SET … [WHERE …]`` from a column:value body + parsed
-    filters. ``window=(has_limit, has_offset)`` applies the client's explicit
-    ?limit/?offset (with ?order) via a ctid subquery."""
+    filters. ``window=(limit, offset)`` applies the client's explicit,
+    validated ?limit/?offset (with ?order) via a ctid subquery."""
     if not body:
         json_error("bad_request", "PATCH body must contain at least one column.", 400)
     set_parts: list[str] = []
@@ -350,7 +330,7 @@ def build_delete_sql(
     ti: TableInfo,
     qp: ParsedQuery,
     returning: str | None,
-    window: tuple[bool, bool] | None = None,
+    window: tuple[int | None, int | None] | None = None,
 ) -> tuple[str, list]:
     """Assemble ``DELETE FROM … [WHERE …]`` from parsed filters. ``window``
     applies the client's explicit ?limit/?offset via a ctid subquery."""
@@ -380,15 +360,34 @@ def _single_object(rows: list[dict]):
     return rows[0]
 
 
-def _write_window(request: Request) -> tuple[bool, bool] | None:
-    """The client's explicit write window as ``(has_limit, has_offset)``.
+def _parse_window_int(raw: str, name: str, maximum: int | None) -> int:
+    try:
+        value = int(raw)
+    except ValueError:
+        json_error("bad_request", f"'{name}' must be an integer.", 400)
+    if value < 0:
+        json_error("bad_request", f"'{name}' must be >= 0.", 400)
+    if maximum is not None and value > maximum:
+        # A write must never be silently capped (a clamped DELETE would leave
+        # rows behind while reporting success) — reject instead.
+        json_error("bad_request", f"'{name}' must be <= {maximum} on writes.", 400)
+    return value
 
-    None when neither param is present — parse_query always fills a default
-    limit, which must NOT window an unqualified bulk write.
+
+def _write_window(request: Request, max_limit: int) -> tuple[int | None, int | None] | None:
+    """The client's explicit write window as validated ``(limit, offset)``.
+
+    None when neither param is present (an empty value counts as absent) —
+    parse_query always fills a default limit, which must NOT window an
+    unqualified bulk write; nor may the clamp used on reads apply here.
     """
-    has_limit = "limit" in request.query_params
-    has_offset = "offset" in request.query_params
-    return (has_limit, has_offset) if (has_limit or has_offset) else None
+    raw_limit = request.query_params.get("limit")
+    raw_offset = request.query_params.get("offset")
+    limit = _parse_window_int(raw_limit, "limit", max_limit) if raw_limit else None
+    offset = _parse_window_int(raw_offset, "offset", None) if raw_offset else None
+    if limit is None and offset is None:
+        return None
+    return limit, offset
 
 
 def _get_core(auth, request: Request, response: Response, table: str):
@@ -439,7 +438,7 @@ def _update_core(auth, request: Request, table: str, body) -> tuple[list[dict] |
     qp = parse_query(request.query_params, ti.spec, reserved=_RESERVED)
     representation = wants_return(request) == "representation"
     sql, params = build_update_sql(
-        ti, body, qp, qp.select_list if representation else None, window=_write_window(request)
+        ti, body, qp, qp.select_list if representation else None, window=_write_window(request, ti.spec.max_limit)
     )
     if representation:
         rows = _encode_rows(db_query(auth.conn, sql, params))
@@ -453,7 +452,9 @@ def _delete_core(auth, request: Request, table: str) -> tuple[list[dict] | None,
     _check_known_keys(request.query_params, ti.spec)
     qp = parse_query(request.query_params, ti.spec, reserved=_RESERVED)
     representation = wants_return(request) == "representation"
-    sql, params = build_delete_sql(ti, qp, qp.select_list if representation else None, window=_write_window(request))
+    sql, params = build_delete_sql(
+        ti, qp, qp.select_list if representation else None, window=_write_window(request, ti.spec.max_limit)
+    )
     if representation:
         rows = _encode_rows(db_query(auth.conn, sql, params))
         return rows, len(rows)

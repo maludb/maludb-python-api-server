@@ -12,13 +12,12 @@ from psycopg.types.json import Jsonb
 from starlette.datastructures import QueryParams
 
 from app.errors import APIError
-from app.helpers.query import Col, QuerySpec, parse_query
-from app.helpers.reflect import REST_DEFAULT_LIMIT, REST_MAX_LIMIT, TableInfo, quote_ident
+from app.helpers.query import Col, QuerySpec, parse_query, quote_ident, split_quoted_list
+from app.helpers.reflect import REST_DEFAULT_LIMIT, REST_MAX_LIMIT, TableInfo
 from app.main import app
 from app.routers.rest import (
     _check_insert_keys,
     _check_known_keys,
-    _split_columns,
     build_delete_sql,
     build_insert_sql,
     build_update_sql,
@@ -97,12 +96,10 @@ class TestStrictKeys:
         assert exc.value.status == 400
         assert exc.value.code == "unknown_column"
 
-    def test_extra_allowlist(self):
+    def test_insert_control_keys_rejected_on_reads(self):
         ti = make_table()
-        params = QueryParams("columns=title&on_conflict=id")
         with pytest.raises(APIError):
-            _check_known_keys(params, ti.spec)
-        _check_known_keys(params, ti.spec, frozenset({"columns", "on_conflict"}))  # no raise
+            _check_known_keys(QueryParams("columns=title"), ti.spec)
 
 
 # ---------------------------------------------------------------------------
@@ -243,7 +240,7 @@ class TestBuildUpdateDelete:
         """?limit= on DELETE must window via ctid — never silently over-delete."""
         ti = make_table()
         qp = parsed("done=is.true&order=id&limit=1", ti)
-        sql, params = build_delete_sql(ti, qp, None, window=(True, False))
+        sql, params = build_delete_sql(ti, qp, None, window=(1, None))
         assert sql == (
             'DELETE FROM "todos" WHERE ctid IN '
             '(SELECT ctid FROM "todos" WHERE "done" IS TRUE ORDER BY "id" ASC LIMIT %s)'
@@ -253,7 +250,7 @@ class TestBuildUpdateDelete:
     def test_windowed_update_param_order(self):
         ti = make_table()
         qp = parsed("id=gte.10&limit=2&offset=1", ti)
-        sql, params = build_update_sql(ti, {"done": True}, qp, None, window=(True, True))
+        sql, params = build_update_sql(ti, {"done": True}, qp, None, window=(2, 1))
         assert sql == (
             'UPDATE "todos" SET "done" = %s WHERE ctid IN '
             '(SELECT ctid FROM "todos" WHERE "id" >= %s  LIMIT %s OFFSET %s)'
@@ -265,7 +262,7 @@ class TestBuildUpdateDelete:
         the write — that would silently cap a bulk delete."""
         ti = make_table()
         qp = parsed("done=is.true&offset=5", ti)
-        sql, params = build_delete_sql(ti, qp, None, window=(False, True))
+        sql, params = build_delete_sql(ti, qp, None, window=(None, 5))
         assert "LIMIT" not in sql
         assert sql.endswith("OFFSET %s)")
         assert params == [5]
@@ -318,16 +315,61 @@ class TestAdaptAndInsertKeys:
         _check_known_keys(QueryParams("debug=1"), ti.spec)  # trace flag still fine
 
 
-class TestSplitColumns:
+class TestSplitQuotedList:
     def test_plain_and_quoted(self):
-        assert _split_columns("a,b") == ["a", "b"]
-        assert _split_columns('"sku","name"') == ["sku", "name"]
+        assert split_quoted_list("a,b") == ["a", "b"]
+        assert split_quoted_list('"sku","name"') == ["sku", "name"]
 
     def test_quoted_name_containing_comma(self):
-        assert _split_columns('"a,b","title"') == ["a,b", "title"]
+        assert split_quoted_list('"a,b","title"') == ["a,b", "title"]
 
     def test_doubled_quotes_unescaped(self):
-        assert _split_columns('"we""ird"') == ['we"ird']
+        assert split_quoted_list('"we""ird"') == ['we"ird']
+
+
+class TestRound3Regressions:
+    def test_in_list_unquotes_values(self):
+        """supabase clients quote in.() values containing : or , — the quotes
+        must be stripped or the filter silently matches nothing."""
+        ti = make_table()
+        qp = parse_query(QueryParams('title=in.("a,b","2026-07-01T12:00:00Z",plain)'), ti.spec)
+        assert qp.where_params == ["a,b", "2026-07-01T12:00:00Z", "plain"]
+
+    def test_unsupported_operator_rejected(self):
+        ti = make_table()
+        for raw in ("tags=cs.{a}", "tags=ov.{a,b}", "tags=not.cs.{a}"):
+            with pytest.raises(APIError) as exc:
+                parse_query(QueryParams(raw), ti.spec)
+            assert exc.value.status == 400, raw
+            assert "not supported" in exc.value.message
+
+    def test_quote_ident_escapes_percent(self):
+        """A lone % in spliced SQL is a psycopg placeholder error — reflected
+        identifiers containing % must double it."""
+        assert quote_ident("growth%") == '"growth%%"'
+        assert quote_ident("plain") == '"plain"'
+
+    def test_duplicate_debug_params_all_checked(self):
+        ti = make_table()
+        with pytest.raises(APIError):
+            _check_known_keys(QueryParams("debug=eq.true&debug=1"), ti.spec)
+
+    def test_write_window_rejects_over_max(self):
+        from starlette.requests import Request as StarletteRequest
+
+        from app.routers.rest import _write_window
+
+        def req(qs: str):
+            return StarletteRequest({"type": "http", "query_string": qs.encode(), "headers": []})
+
+        with pytest.raises(APIError) as exc:
+            _write_window(req("limit=5000"), 1000)
+        assert exc.value.status == 400
+
+        assert _write_window(req("limit="), 1000) is None  # empty value = absent
+        assert _write_window(req(""), 1000) is None
+        assert _write_window(req("limit=5&offset=2"), 1000) == (5, 2)
+        assert _write_window(req("offset=3"), 1000) == (None, 3)
 
 
 class TestLimitClamp:

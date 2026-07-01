@@ -242,6 +242,33 @@ class TestRestFlavorE2E:
         r = client.delete(f"/rest/v1/{TABLE}?debug=eq.true")
         assert r.status_code == 400
 
+    def test_in_list_with_quoted_values(self, client):
+        client.post(f"/rest/v1/{TABLE}", json=[{"title": "q,1"}, {"title": "q2"}])
+        r = client.get(f'/rest/v1/{TABLE}?title=in.("q,1",q2)&select=title&order=title')
+        assert [x["title"] for x in r.json()] == ["q,1", "q2"]
+        client.delete(f'/rest/v1/{TABLE}?title=in.("q,1",q2)')
+
+    def test_unsupported_operator_is_400_not_silent(self, client):
+        r = client.delete(f"/rest/v1/{TABLE}?tags=cs.{{a}}")
+        assert r.status_code == 400
+        assert "not supported" in r.json()["message"]
+
+    def test_percent_column_name_works(self, client):
+        import psycopg
+
+        with psycopg.connect(DSN, autocommit=True) as conn:
+            conn.execute("DROP TABLE IF EXISTS e2e_pct")
+            conn.execute('CREATE TABLE e2e_pct (id int PRIMARY KEY, "growth%" int)')
+        try:
+            r = client.post("/rest/v1/e2e_pct", json={"id": 1, "growth%": 42}, headers=REPR)
+            assert r.status_code == 201, r.text
+            assert r.json()[0]["growth%"] == 42
+            r = client.get("/rest/v1/e2e_pct?select=*")
+            assert r.json() == [{"id": 1, "growth%": 42}]
+        finally:
+            with psycopg.connect(DSN, autocommit=True) as conn:
+                conn.execute("DROP TABLE e2e_pct")
+
     def test_heterogeneous_merge_upsert_rejected(self, client):
         r = client.post(
             f"/rest/v1/{TABLE}?on_conflict=title",
