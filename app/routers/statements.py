@@ -10,15 +10,46 @@ runs inside db_tx_core() so the facade can resolve its malu$* base tables + RLS 
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Query, Request
+from fastapi import APIRouter, Request, Response
 from fastapi.responses import JSONResponse
 
 from app.auth import Auth
 from app.database import db_one, db_query, db_tx_core
 from app.errors import json_error
+from app.helpers.query import Col, QuerySpec, content_range, parse_query, resolve_total, wants_count
 from app.helpers.statements import STATEMENT_COLS, shape_statement, svpor_create_statement
+from app.helpers.writes import as_items
 
 router = APIRouter()
+
+
+# ---------------------------------------------------------------------------
+# Query spec — allowlist for the PostgREST-style grammar on GET /v1/statements.
+# Mirrors STATEMENT_COLS; the original exact filters (provenance, *_kind, *_id,
+# verb_id) are kept for back-compat as reserved legacy params.
+# ---------------------------------------------------------------------------
+
+STATEMENT_QUERY = QuerySpec(
+    columns={
+        "id": Col("statement_id", int),
+        "subject_kind": Col("subject_kind", str),
+        "subject_id": Col("subject_id", int),
+        "verb_id": Col("verb_id", int),
+        "object_kind": Col("object_kind", str),
+        "object_id": Col("object_id", int),
+        "predicate_id": Col("predicate_id", int),
+        "valid_from": Col("valid_from", str),
+        "valid_to": Col("valid_to", str),
+        "confidence": Col("confidence", float),
+        "provenance": Col("provenance", str),
+        "source_package_id": Col("source_package_id", int),
+        "metadata": Col("metadata_jsonb", str),
+        "created_at": Col("created_at", str),
+    },
+    default_order=[("id", "desc")],
+    default_limit=50,
+    max_limit=200,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -45,70 +76,50 @@ def _load_statement(conn, statement_id: int) -> dict | None:
 
 
 @router.get("/v1/statements")
-def list_statements(
-    auth: Auth,
-    provenance: str | None = Query(default=None, max_length=40),
-    object_kind: str | None = Query(default=None, max_length=40),
-    subject_kind: str | None = Query(default=None, max_length=40),
-    object_id: int | None = Query(default=None),
-    subject_id: int | None = Query(default=None),
-    verb_id: int | None = Query(default=None),
-    limit: int = Query(default=50, le=200),
-):
+def list_statements(auth: Auth, request: Request, response: Response):
+    # provenance / subject_kind / object_kind / subject_id / object_id / verb_id
+    # are ordinary spec columns: bare values are exact-match (back-compat), and
+    # the op grammar (?subject_id=in.(1,2)) works too — all via the parser.
+    qp = parse_query(request.query_params, STATEMENT_QUERY)
+    where_params = qp.where_params
+    count_kind = wants_count(request)
+
     def _query(conn):
-        clauses: list[str] = []
-        params: list = []
-        if provenance:
-            clauses.append("provenance = %s")
-            params.append(provenance)
-        if object_kind:
-            clauses.append("object_kind = %s")
-            params.append(object_kind)
-        if subject_kind:
-            clauses.append("subject_kind = %s")
-            params.append(subject_kind)
-        if object_id is not None:
-            clauses.append("object_id = %s")
-            params.append(object_id)
-        if subject_id is not None:
-            clauses.append("subject_id = %s")
-            params.append(subject_id)
-        if verb_id is not None:
-            clauses.append("verb_id = %s")
-            params.append(verb_id)
-
-        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
-
-        sql = f"""SELECT {STATEMENT_COLS}
+        sql = f"""SELECT {qp.select_list}
                     FROM maludb_svpor_statement
-                    {where}
-                   ORDER BY statement_id DESC
-                   LIMIT %s"""
-        params.append(limit)
+                    {qp.where_sql}
+                   {qp.order_sql}
+                   {qp.limit_sql}"""
 
-        rows = db_query(conn, sql, params)
+        rows = db_query(conn, sql, where_params + qp.limit_params)
         for r in rows:
             shape_statement(r)
-        return rows
+        total = resolve_total(conn, count_kind, "maludb_svpor_statement", qp.where_sql, where_params)
+        return rows, total
 
-    rows = db_tx_core(auth.conn, _query)
+    rows, total = db_tx_core(auth.conn, _query)
+    response.headers["Content-Range"] = content_range(qp.offset, len(rows), total)
     return {"statements": rows}
 
 
 # ===========================================================================
-# POST /v1/statements — create a statement
+# POST /v1/statements — create one statement (JSON object) or many (JSON array)
 # ===========================================================================
 
 
 @router.post("/v1/statements")
 async def create_statement(auth: Auth, request: Request):
-    body = await request.json()
+    # A JSON array bulk-creates; every item runs through the same idempotent
+    # facade in ONE transaction (all-or-nothing). A JSON object is unchanged.
+    items, is_batch = as_items(await request.json())
 
     def _create(conn):
-        return svpor_create_statement(conn, body)
+        return [svpor_create_statement(conn, item) for item in items]
 
-    stmt = db_tx_core(auth.conn, _create)
-    return JSONResponse(status_code=201, content={"statement": stmt})
+    created = db_tx_core(auth.conn, _create)
+    if is_batch:
+        return JSONResponse(status_code=201, content={"statements": created})
+    return JSONResponse(status_code=201, content={"statement": created[0]})
 
 
 # ===========================================================================

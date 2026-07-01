@@ -14,14 +14,37 @@ Subject links live in maludb_subject_verb keyed by verb_name (= canonical_name).
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Query, Request
+from fastapi import APIRouter, Request, Response
 from fastapi.responses import JSONResponse
 
 from app.auth import Auth
 from app.database import db_exec, db_one, db_query
 from app.errors import json_error
+from app.helpers.query import Col, QuerySpec, build_where, content_range, parse_query, resolve_total, wants_count
+from app.helpers.writes import as_items, tx_with_advisory_lock
 
 router = APIRouter()
+
+
+# ---------------------------------------------------------------------------
+# Query spec — allowlist for the PostgREST-style grammar on GET /v1/verbs.
+# ---------------------------------------------------------------------------
+
+_LINKED_SUBJECTS = "(SELECT count(*) FROM maludb_subject_verb sv WHERE sv.verb_name = v.canonical_name)"
+
+VERB_QUERY = QuerySpec(
+    columns={
+        "id": Col("v.verb_id", int),
+        "canonical_name": Col("v.canonical_name", str),
+        "type": Col("v.verb_type", str),
+        "description": Col("v.description", str),
+        "classifier_md": Col("v.classifier_md", str),
+        "linked_subjects": Col(_LINKED_SUBJECTS, int),
+    },
+    default_order=[("canonical_name", "asc")],
+    default_limit=50,
+    max_limit=200,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -70,35 +93,37 @@ def _load_verb_detail(auth: Auth, verb_id: int) -> dict | None:
 
 
 @router.get("/v1/verbs")
-async def list_verbs(
-    auth: Auth,
-    q: str | None = Query(default=None, max_length=200),
-    limit: int = Query(default=50, le=200),
-) -> JSONResponse:
-    where = ""
-    params: list = []
+async def list_verbs(auth: Auth, request: Request, response: Response):
+    params = request.query_params
+    qp = parse_query(params, VERB_QUERY, reserved=("q",))
+    where_params = list(qp.where_params)
+
+    # Back-compat: ?q= keeps its substring search over name + description.
+    q_clause = ""
+    q = params.get("q")
     if q:
-        where = "WHERE v.canonical_name ILIKE %s OR v.description ILIKE %s"
-        params = [f"%{q}%", f"%{q}%"]
+        q_clause = "(v.canonical_name ILIKE %s OR v.description ILIKE %s)"
+        where_params += [f"%{q}%", f"%{q}%"]
 
-    sql = f"""SELECT v.verb_id        AS id,
-                     v.canonical_name AS canonical_name,
-                     v.verb_type      AS type,
-                     v.description,
-                     v.classifier_md,
-                     (SELECT count(*) FROM maludb_subject_verb sv
-                        WHERE sv.verb_name = v.canonical_name) AS linked_subjects
+    where_sql = build_where(qp.where_clause, q_clause)
+
+    sql = f"""SELECT {qp.select_list}
                 FROM maludb_verb v
-                {where}
-               ORDER BY v.canonical_name
-               LIMIT {limit}"""
+                {where_sql}
+                {qp.order_sql}
+                {qp.limit_sql}"""
 
-    rows = db_query(auth.conn, sql, params)
+    rows = db_query(auth.conn, sql, where_params + qp.limit_params)
     for r in rows:
-        r["id"] = int(r["id"])
-        r["linked_subjects"] = int(r["linked_subjects"])
+        if r.get("id") is not None:
+            r["id"] = int(r["id"])
+        if r.get("linked_subjects") is not None:
+            r["linked_subjects"] = int(r["linked_subjects"])
 
-    return JSONResponse(content={"verbs": rows})
+    total = resolve_total(auth.conn, wants_count(request), "maludb_verb v", where_sql, where_params)
+    response.headers["Content-Range"] = content_range(qp.offset, len(rows), total)
+
+    return {"verbs": rows}
 
 
 # ---------------------------------------------------------------------------
@@ -106,20 +131,19 @@ async def list_verbs(
 # ---------------------------------------------------------------------------
 
 
-@router.post("/v1/verbs")
-async def create_verb(auth: Auth, request: Request) -> JSONResponse:
-    body = await request.json()
-
-    name = str(body.get("canonical_name") or "").strip()
+def _insert_verb(conn, item: dict) -> dict:
+    """Validate + insert one verb, returning the shaped row. Runs under the
+    maludb_verb advisory lock so the MAX(verb_id)+1 id can't collide."""
+    name = str(item.get("canonical_name") or "").strip()
     if not name:
         json_error("missing_field", 'Field "canonical_name" is required.', 400)
 
-    vtype = str(body["type"]) if body.get("type") is not None else None
-    description = str(body["description"]) if body.get("description") is not None else None
-    classifier_md = str(body["classifier_md"]) if body.get("classifier_md") is not None else None
+    vtype = str(item["type"]) if item.get("type") is not None else None
+    description = str(item["description"]) if item.get("description") is not None else None
+    classifier_md = str(item["classifier_md"]) if item.get("classifier_md") is not None else None
 
     created = db_one(
-        auth.conn,
+        conn,
         """INSERT INTO maludb_verb
                (verb_id, canonical_name, verb_type, description, classifier_md, created_at)
            SELECT COALESCE(MAX(verb_id), 0) + 1, %s, %s, %s, %s, now()
@@ -131,11 +155,24 @@ async def create_verb(auth: Auth, request: Request) -> JSONResponse:
                      classifier_md""",
         [name, vtype, description, classifier_md],
     )
-
     created["id"] = int(created["id"])
     created["linked_subjects"] = 0
+    return created
 
-    return JSONResponse(status_code=201, content={"verb": created})
+
+@router.post("/v1/verbs")
+async def create_verb(auth: Auth, request: Request) -> JSONResponse:
+    # A JSON array bulk-creates; a JSON object is unchanged. All inserts run in
+    # one transaction under the maludb_verb advisory lock (all-or-nothing).
+    items, is_batch = as_items(await request.json())
+    created = tx_with_advisory_lock(
+        auth.conn,
+        "maludb_verb",
+        lambda conn: [_insert_verb(conn, item) for item in items],
+    )
+    if is_batch:
+        return JSONResponse(status_code=201, content={"verbs": created})
+    return JSONResponse(status_code=201, content={"verb": created[0]})
 
 
 # ---------------------------------------------------------------------------

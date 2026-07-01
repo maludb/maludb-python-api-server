@@ -15,7 +15,7 @@ Relationships live in maludb_subject_relationship (from/to subject ids).
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Query, Request
+from fastapi import APIRouter, Request, Response
 from fastapi.responses import JSONResponse
 
 from app.auth import Auth
@@ -23,8 +23,39 @@ from app.database import db_exec, db_one, db_query, db_tx_core
 from app.errors import json_error
 from app.helpers.attributes import attach_attributes
 from app.helpers.documents import document_neighbors
+from app.helpers.query import Col, QuerySpec, build_where, content_range, parse_query, resolve_total, wants_count
+from app.helpers.writes import as_items, tx_with_advisory_lock
 
 router = APIRouter()
+
+
+# ---------------------------------------------------------------------------
+# Query spec — the allowlist of columns clients may filter / select / order on
+# via the PostgREST-style query grammar (?col=eq.x, ?select=, ?order=, limit/offset).
+# The SELECT/FROM text stays literal in the handler; only these expressions and
+# the assembled WHERE/ORDER/LIMIT fragments are spliced in (never client input).
+# ---------------------------------------------------------------------------
+
+_LINKED_VERBS = "(SELECT count(*) FROM maludb_subject_verb sv WHERE sv.subject_name = s.canonical_name)"
+_RELATED_SUBJECTS = (
+    "(SELECT count(*) FROM maludb_subject_relationship r "
+    "WHERE r.from_subject_id = s.subject_id OR r.to_subject_id = s.subject_id)"
+)
+
+SUBJECT_QUERY = QuerySpec(
+    columns={
+        "id": Col("s.subject_id", int),
+        "label": Col("s.canonical_name", str),
+        "type": Col("s.subject_type", str),
+        "description": Col("s.description", str),
+        "classifier_md": Col("s.classifier_md", str),
+        "linked_verbs": Col(_LINKED_VERBS, int),
+        "related_subjects": Col(_RELATED_SUBJECTS, int),
+    },
+    default_order=[("label", "asc")],
+    default_limit=50,
+    max_limit=200,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -151,42 +182,45 @@ def _load_relationship(auth: Auth, rel_id: int) -> dict | None:
 
 
 @router.get("/v1/subjects")
-def list_subjects(
-    auth: Auth,
-    q: str | None = Query(default=None, max_length=200),
-    limit: int = Query(default=50, le=200),
-    with_: str | None = Query(default=None, alias="with", max_length=40),
-):
-    where = ""
-    params: list = []
+def list_subjects(auth: Auth, request: Request, response: Response):
+    # PostgREST-style filtering/select/order/pagination via the shared parser.
+    # `q` (legacy substring search) and `with` (attribute embed) are consumed here,
+    # so they're reserved from the column-filter grammar.
+    params = request.query_params
+    qp = parse_query(params, SUBJECT_QUERY, reserved=("q", "with"))
+    where_params = list(qp.where_params)
+
+    # Back-compat: ?q= keeps its substring search over name + description.
+    q_clause = ""
+    q = params.get("q")
     if q:
-        where = "WHERE s.canonical_name ILIKE %s OR s.description ILIKE %s"
-        params = [f"%{q}%", f"%{q}%"]
+        q_clause = "(s.canonical_name ILIKE %s OR s.description ILIKE %s)"
+        where_params += [f"%{q}%", f"%{q}%"]
 
-    sql = f"""SELECT s.subject_id     AS id,
-                     s.canonical_name AS label,
-                     s.subject_type   AS type,
-                     s.description,
-                     s.classifier_md,
-                     (SELECT count(*) FROM maludb_subject_verb sv
-                        WHERE sv.subject_name = s.canonical_name) AS linked_verbs,
-                     (SELECT count(*) FROM maludb_subject_relationship r
-                        WHERE r.from_subject_id = s.subject_id
-                           OR r.to_subject_id   = s.subject_id) AS related_subjects
+    where_sql = build_where(qp.where_clause, q_clause)
+
+    sql = f"""SELECT {qp.select_list}
                 FROM maludb_subject s
-                {where}
-               ORDER BY s.canonical_name
-               LIMIT %s"""
-    params.append(limit)
+                {where_sql}
+                {qp.order_sql}
+                {qp.limit_sql}"""
 
-    rows = db_query(auth.conn, sql, params)
+    rows = db_query(auth.conn, sql, where_params + qp.limit_params)
     for r in rows:
-        r["id"] = int(r["id"])
-        r["linked_verbs"] = int(r["linked_verbs"])
-        r["related_subjects"] = int(r["related_subjects"])
+        if r.get("id") is not None:
+            r["id"] = int(r["id"])
+        if r.get("linked_verbs") is not None:
+            r["linked_verbs"] = int(r["linked_verbs"])
+        if r.get("related_subjects") is not None:
+            r["related_subjects"] = int(r["related_subjects"])
 
-    if with_ == "attributes":
+    # ?with=attributes embeds attributes; it keys on each row's `id`, so it
+    # requires `id` in the projection (the default select includes it).
+    if params.get("with") == "attributes" and (not rows or "id" in rows[0]):
         attach_attributes(auth.conn, rows, "maludb_subject_with_attributes", "subject_id")
+
+    total = resolve_total(auth.conn, wants_count(request), "maludb_subject s", where_sql, where_params)
+    response.headers["Content-Range"] = content_range(qp.offset, len(rows), total)
 
     return {"subjects": rows}
 
@@ -196,23 +230,22 @@ def list_subjects(
 # ===========================================================================
 
 
-@router.post("/v1/subjects")
-async def create_subject(auth: Auth, request: Request):
-    body = await request.json()
-
-    label = (body.get("label") or "").strip() if isinstance(body.get("label"), str) else ""
+def _insert_subject(conn, item: dict) -> dict:
+    """Validate + insert one subject, returning the shaped row. Runs under the
+    maludb_subject advisory lock so the MAX(subject_id)+1 id can't collide."""
+    label = (item.get("label") or "").strip() if isinstance(item.get("label"), str) else ""
     if not label:
         json_error("missing_field", 'Field "label" is required.', 400)
 
-    type_ = str(body["type"]) if "type" in body and body["type"] is not None else None
-    description = str(body["description"]) if "description" in body and body["description"] is not None else None
+    type_ = str(item["type"]) if "type" in item and item["type"] is not None else None
+    description = str(item["description"]) if "description" in item and item["description"] is not None else None
     classifier_md = (
-        str(body["classifier_md"]) if "classifier_md" in body and body["classifier_md"] is not None else None
+        str(item["classifier_md"]) if "classifier_md" in item and item["classifier_md"] is not None else None
     )
 
     # subject_id has no sequence — derive it inline (MAX + 1).
     created = db_one(
-        auth.conn,
+        conn,
         """INSERT INTO maludb_subject
                (subject_id, canonical_name, subject_type, description, classifier_md, created_at)
            SELECT COALESCE(MAX(subject_id), 0) + 1, %s, %s, %s, %s, now()
@@ -224,11 +257,24 @@ async def create_subject(auth: Auth, request: Request):
                      classifier_md""",
         [label, type_, description, classifier_md],
     )
-
     created["id"] = int(created["id"])
     created["linked_verbs"] = 0
+    return created
 
-    return JSONResponse(status_code=201, content={"subject": created})
+
+@router.post("/v1/subjects")
+async def create_subject(auth: Auth, request: Request):
+    # A JSON array bulk-creates; a JSON object is unchanged. All inserts run in
+    # one transaction under the maludb_subject advisory lock (all-or-nothing).
+    items, is_batch = as_items(await request.json())
+    created = tx_with_advisory_lock(
+        auth.conn,
+        "maludb_subject",
+        lambda conn: [_insert_subject(conn, item) for item in items],
+    )
+    if is_batch:
+        return JSONResponse(status_code=201, content={"subjects": created})
+    return JSONResponse(status_code=201, content={"subject": created[0]})
 
 
 # ===========================================================================

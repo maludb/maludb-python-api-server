@@ -32,7 +32,7 @@ import base64
 import binascii
 import json
 
-from fastapi import APIRouter, Query, Request
+from fastapi import APIRouter, Query, Request, Response
 from fastapi.responses import JSONResponse
 
 from app.auth import Auth, get_auth_store
@@ -40,6 +40,7 @@ from app.database import db_exec, db_one, db_query, db_tx_core
 from app.errors import json_error
 from app.helpers.llm import llm_complete, llm_json_from_text
 from app.helpers.llm_resolve import resolve_task_config
+from app.helpers.query import Col, QuerySpec, build_where, content_range, parse_query, resolve_total, wants_count
 from app.helpers.skills import (
     build_reindex_params,
     bundle_hash,
@@ -58,6 +59,25 @@ _MAX_BUNDLE_BYTES = 30 * 1024 * 1024
 
 # Content columns rejected on PATCH once a skill carries a bundle_hash.
 _IMMUTABLE_FIELDS = ("name", "markdown", "version", "packaging_kind")
+
+# Query spec — allowlist for the PostgREST-style grammar on the plain browse
+# list of GET /v1/skills (the tag-search branch below is unaffected). Legacy
+# ?visibility= (exact) and ?q= (substring) stay as reserved filters.
+SKILL_QUERY = QuerySpec(
+    columns={
+        "id": Col("skill_id", int),
+        "name": Col("skill_name", str),
+        "description": Col("description", str),
+        "version": Col("version", str),
+        "visibility": Col("visibility", str),
+        "packaging_kind": Col("packaging_kind", str),
+        "enabled": Col("enabled", bool),
+        "created_at": Col("created_at", str),
+    },
+    default_order=[("name", "asc")],
+    default_limit=50,
+    max_limit=200,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -88,14 +108,13 @@ def _load_skill(auth: Auth, skill_id: int) -> dict | None:
 
 
 @router.get("/v1/skills")
-def list_skills(
-    auth: Auth,
-    visibility: str | None = Query(default=None, max_length=40),
-    q: str | None = Query(default=None, max_length=200),
-    subject: str | None = Query(default=None, max_length=200),
-    verb: str | None = Query(default=None, max_length=200),
-    limit: int = Query(default=50, le=200),
-):
+def list_skills(auth: Auth, request: Request, response: Response):
+    params = request.query_params
+    q = params.get("q")
+    subject = params.get("subject")
+    verb = params.get("verb")
+    visibility = params.get("visibility")
+
     # Tag-aware discovery: subject/verb hit the skill_subject/skill_verb tag
     # tables, and a plain `q` rides the keyword(+40)/full-text(+10) rails of
     # find_skill via maludb_skill_search, which also folds in visible public
@@ -105,6 +124,16 @@ def list_skills(
     # function doesn't take, so a visibility-filtered `q` stays on the ILIKE
     # list; the no-arg list keeps the original ILIKE semantics too.
     if subject or verb or (q and not visibility):
+        # This discovery path can't offset-paginate; reject offset rather than
+        # silently returning duplicate pages under an unchanged Content-Range.
+        if params.get("offset") not in (None, "", "0"):
+            json_error("bad_request", "offset is not supported with skill text/tag search; use limit only.", 400)
+        raw_limit = params.get("limit")
+        try:
+            search_limit = int(raw_limit) if raw_limit not in (None, "") else 50
+        except ValueError:
+            json_error("validation_failed", "'limit' must be an integer.", 422)
+        search_limit = max(0, min(search_limit, 200))
         rows = db_query(
             auth.conn,
             """SELECT owner_schema, skill_id AS id, skill_name AS name, description,
@@ -112,38 +141,45 @@ def list_skills(
                       match_reasons, is_public, is_forkable,
                       source_owner_schema, source_skill_id, updated_at
                  FROM maludb_skill_search(%s, %s, %s, NULL, %s)""",
-            [q, subject, verb, limit],
+            [q, subject, verb, search_limit],
         )
         for r in rows:
             r["id"] = int(r["id"])
             r["score"] = None if r["score"] is None else float(r["score"])
             if r["source_skill_id"] is not None:
                 r["source_skill_id"] = int(r["source_skill_id"])
+        # Discovery results aren't offset-paginated or countable; report an open range.
+        response.headers["Content-Range"] = content_range(0, len(rows), None)
         return {"skills": rows}
 
-    clauses: list[str] = []
-    params: list = []
-    if visibility:
-        clauses.append("visibility = %s")
-        params.append(visibility)
+    # Plain browse list — PostgREST-style grammar via the shared parser. ?visibility=
+    # is an ordinary spec column now (bare value = exact-match, op grammar works);
+    # ?q= stays a substring shortcut; subject/verb only affect branch routing above.
+    qp = parse_query(params, SKILL_QUERY, reserved=("q", "subject", "verb"))
+    where_params = list(qp.where_params)
+
+    q_clause = ""
     if q:
-        clauses.append("(skill_name ILIKE %s OR description ILIKE %s)")
-        params.extend([f"%{q}%", f"%{q}%"])
+        q_clause = "(skill_name ILIKE %s OR description ILIKE %s)"
+        where_params += [f"%{q}%", f"%{q}%"]
 
-    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    where_sql = build_where(qp.where_clause, q_clause)
 
-    sql = f"""SELECT skill_id AS id, skill_name AS name, description, version,
-                     visibility, packaging_kind, enabled, created_at
+    sql = f"""SELECT {qp.select_list}
                 FROM maludb_skill
-                {where}
-               ORDER BY skill_name
-               LIMIT %s"""
-    params.append(limit)
+                {where_sql}
+                {qp.order_sql}
+                {qp.limit_sql}"""
 
-    rows = db_query(auth.conn, sql, params)
+    rows = db_query(auth.conn, sql, where_params + qp.limit_params)
     for r in rows:
-        r["id"] = int(r["id"])
-        r["enabled"] = None if r["enabled"] is None else bool(r["enabled"])
+        if r.get("id") is not None:
+            r["id"] = int(r["id"])
+        if "enabled" in r:
+            r["enabled"] = None if r["enabled"] is None else bool(r["enabled"])
+
+    total = resolve_total(auth.conn, wants_count(request), "maludb_skill", where_sql, where_params)
+    response.headers["Content-Range"] = content_range(qp.offset, len(rows), total)
 
     return {"skills": rows}
 

@@ -17,15 +17,36 @@ functions resolve correctly.
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Query, Request
+from fastapi import APIRouter, Request, Response
 from fastapi.responses import JSONResponse
 
 from app.auth import Auth
 from app.database import db_exec, db_one, db_query, db_tx_core
 from app.errors import json_error
 from app.helpers.documents import document_neighbors
+from app.helpers.query import Col, QuerySpec, build_where, content_range, parse_query, resolve_total, wants_count
+from app.helpers.writes import as_items, tx_with_advisory_lock
 
 router = APIRouter()
+
+
+# ---------------------------------------------------------------------------
+# Query spec — allowlist for the PostgREST-style grammar on GET /v1/projects.
+# A project is a subject of type 'project' (table maludb_project).
+# ---------------------------------------------------------------------------
+
+PROJECT_QUERY = QuerySpec(
+    columns={
+        "id": Col("subject_id", int),
+        "name": Col("canonical_name", str),
+        "description": Col("description", str),
+        "classifier_md": Col("classifier_md", str),
+        "archived_at": Col("archived_at", str),
+    },
+    default_order=[("name", "asc")],
+    default_limit=50,
+    max_limit=200,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -89,31 +110,33 @@ def _load_project_detail(auth: Auth, project_id: int) -> dict | None:
 
 
 @router.get("/v1/projects")
-def list_projects(
-    auth: Auth,
-    q: str | None = Query(default=None, max_length=200),
-    limit: int = Query(default=50, le=200),
-):
-    where = ""
-    params: list = []
+def list_projects(auth: Auth, request: Request, response: Response):
+    params = request.query_params
+    qp = parse_query(params, PROJECT_QUERY, reserved=("q",))
+    where_params = list(qp.where_params)
+
+    # Back-compat: ?q= keeps its substring search over name + description.
+    q_clause = ""
+    q = params.get("q")
     if q:
-        where = "WHERE canonical_name ILIKE %s OR description ILIKE %s"
-        params = [f"%{q}%", f"%{q}%"]
+        q_clause = "(canonical_name ILIKE %s OR description ILIKE %s)"
+        where_params += [f"%{q}%", f"%{q}%"]
 
-    sql = f"""SELECT subject_id     AS id,
-                     canonical_name AS name,
-                     description,
-                     classifier_md,
-                     archived_at
+    where_sql = build_where(qp.where_clause, q_clause)
+
+    sql = f"""SELECT {qp.select_list}
                 FROM maludb_project
-                {where}
-               ORDER BY canonical_name
-               LIMIT %s"""
-    params.append(limit)
+                {where_sql}
+                {qp.order_sql}
+                {qp.limit_sql}"""
 
-    rows = db_query(auth.conn, sql, params)
+    rows = db_query(auth.conn, sql, where_params + qp.limit_params)
     for r in rows:
-        r["id"] = int(r["id"])
+        if r.get("id") is not None:
+            r["id"] = int(r["id"])
+
+    total = resolve_total(auth.conn, wants_count(request), "maludb_project", where_sql, where_params)
+    response.headers["Content-Range"] = content_range(qp.offset, len(rows), total)
 
     return {"projects": rows}
 
@@ -123,22 +146,22 @@ def list_projects(
 # ===========================================================================
 
 
-@router.post("/v1/projects")
-async def create_project(auth: Auth, request: Request):
-    body = await request.json()
-
-    name = (body.get("name") or "").strip() if isinstance(body.get("name"), str) else ""
+def _insert_project(conn, item: dict) -> dict:
+    """Validate + insert one project (a subject of type 'project'), returning the
+    shaped row. Runs under the maludb_subject advisory lock (shared with
+    /v1/subjects) so the MAX(subject_id)+1 id can't collide."""
+    name = (item.get("name") or "").strip() if isinstance(item.get("name"), str) else ""
     if not name:
         json_error("missing_field", 'Field "name" is required.', 400)
 
-    description = str(body["description"]) if "description" in body and body["description"] is not None else None
+    description = str(item["description"]) if "description" in item and item["description"] is not None else None
     classifier_md = (
-        str(body["classifier_md"]) if "classifier_md" in body and body["classifier_md"] is not None else None
+        str(item["classifier_md"]) if "classifier_md" in item and item["classifier_md"] is not None else None
     )
 
     # A project is a subject of type 'project'; subject_id has no sequence.
     created = db_one(
-        auth.conn,
+        conn,
         """INSERT INTO maludb_subject
                (subject_id, canonical_name, subject_type, description, classifier_md, created_at)
            SELECT COALESCE(MAX(subject_id), 0) + 1, %s, 'project', %s, %s, now()
@@ -150,8 +173,22 @@ async def create_project(auth: Auth, request: Request):
         [name, description, classifier_md],
     )
     created["id"] = int(created["id"])
+    return created
 
-    return JSONResponse(status_code=201, content={"project": created})
+
+@router.post("/v1/projects")
+async def create_project(auth: Auth, request: Request):
+    # A JSON array bulk-creates; a JSON object is unchanged. Inserts run in one
+    # transaction under the maludb_subject advisory lock (shared with subjects).
+    items, is_batch = as_items(await request.json())
+    created = tx_with_advisory_lock(
+        auth.conn,
+        "maludb_subject",
+        lambda conn: [_insert_project(conn, item) for item in items],
+    )
+    if is_batch:
+        return JSONResponse(status_code=201, content={"projects": created})
+    return JSONResponse(status_code=201, content={"project": created[0]})
 
 
 # ===========================================================================

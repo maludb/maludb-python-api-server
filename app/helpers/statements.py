@@ -37,19 +37,23 @@ def shape_statement(row: dict[str, Any]) -> None:
     float, and decode the metadata JSON string (if still a string —
     psycopg v3 with dict_row may auto-decode jsonb columns).
     """
+    # Guard each cast on key presence so a ?select= projection that drops a
+    # column stays dropped (rather than re-added as None) and never KeyErrors.
     for key in ("id", "subject_id", "verb_id", "object_id", "predicate_id", "source_package_id"):
-        val = row.get(key)
-        row[key] = int(val) if val is not None else None
+        if key in row:
+            val = row[key]
+            row[key] = int(val) if val is not None else None
 
-    val = row.get("confidence")
-    row["confidence"] = float(val) if val is not None else None
+    if "confidence" in row:
+        val = row["confidence"]
+        row["confidence"] = float(val) if val is not None else None
 
-    for key in ("metadata",):
-        val = row.get(key)
+    if "metadata" in row:
+        val = row["metadata"]
         if val is None:
-            row[key] = None
+            row["metadata"] = None
         elif isinstance(val, str):
-            row[key] = json.loads(val)
+            row["metadata"] = json.loads(val)
         # else: already decoded by psycopg (dict) — leave as-is
 
 
