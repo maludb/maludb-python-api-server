@@ -21,15 +21,51 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from fastapi import APIRouter, Query, Request
+from fastapi import APIRouter, Query, Request, Response
 from fastapi.responses import JSONResponse
 
 from app.auth import Auth
 from app.database import db_one, db_query, db_tx_core
 from app.errors import json_error
 from app.helpers.attributes import ATTRIBUTE_COLS, shape_attribute, svpor_create_attribute
+from app.helpers.query import Col, QuerySpec, content_range, parse_query, resolve_total, wants_count
+from app.helpers.writes import as_items
 
 router = APIRouter()
+
+
+# ---------------------------------------------------------------------------
+# Query spec — allowlist for the PostgREST-style grammar on GET /v1/attributes.
+# Mirrors ATTRIBUTE_COLS; legacy ?target_kind=/?target_id=/?attr_name=/?provenance=
+# (all exact) are kept for back-compat.
+# ---------------------------------------------------------------------------
+
+ATTRIBUTE_QUERY = QuerySpec(
+    columns={
+        "id": Col("attribute_id", int),
+        "target_kind": Col("target_kind", str),
+        "target_id": Col("target_id", int),
+        "attr_name": Col("attr_name", str),
+        "value_timestamp": Col("value_timestamp", str),
+        "value_range": Col("value_range", str),
+        "value_numeric": Col("value_numeric", float),
+        "value_text": Col("value_text", str),
+        "value_jsonb": Col("value_jsonb", str),
+        "unit": Col("unit", str),
+        "provenance": Col("provenance", str),
+        "confidence": Col("confidence", float),
+        "valid_from": Col("valid_from", str),
+        "valid_to": Col("valid_to", str),
+        "metadata": Col("metadata_jsonb", str),
+        "created_at": Col("created_at", str),
+        "ref_source": Col("ref_source", str),
+        "ref_entity": Col("ref_entity", str),
+        "ref_key": Col("ref_key", str),
+    },
+    default_order=[("id", "desc")],
+    default_limit=50,
+    max_limit=200,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -93,62 +129,49 @@ def _load_template(conn, template_id: int) -> dict | None:
 
 
 @router.get("/v1/attributes")
-def list_attributes(
-    auth: Auth,
-    target_kind: str | None = Query(default=None, max_length=40),
-    target_id: int | None = Query(default=None),
-    attr_name: str | None = Query(default=None, max_length=200),
-    provenance: str | None = Query(default=None, max_length=40),
-    limit: int = Query(default=50, le=200),
-):
+def list_attributes(auth: Auth, request: Request, response: Response):
+    # target_kind / target_id / attr_name / provenance are ordinary spec columns:
+    # bare values are exact-match (back-compat), and the op grammar works too.
+    qp = parse_query(request.query_params, ATTRIBUTE_QUERY)
+    where_params = qp.where_params
+    count_kind = wants_count(request)
+
     def _query(conn):
-        clauses: list[str] = []
-        params: list = []
-        if target_kind:
-            clauses.append("target_kind = %s")
-            params.append(target_kind)
-        if attr_name:
-            clauses.append("attr_name = %s")
-            params.append(attr_name)
-        if provenance:
-            clauses.append("provenance = %s")
-            params.append(provenance)
-        if target_id is not None:
-            clauses.append("target_id = %s")
-            params.append(target_id)
-
-        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
-
-        sql = f"""SELECT {ATTRIBUTE_COLS}
+        sql = f"""SELECT {qp.select_list}
                     FROM maludb_svpor_attribute
-                    {where}
-                   ORDER BY attribute_id DESC
-                   LIMIT %s"""
-        params.append(limit)
+                    {qp.where_sql}
+                   {qp.order_sql}
+                   {qp.limit_sql}"""
 
-        rows = db_query(conn, sql, params)
+        rows = db_query(conn, sql, where_params + qp.limit_params)
         for r in rows:
             shape_attribute(r)
-        return rows
+        total = resolve_total(conn, count_kind, "maludb_svpor_attribute", qp.where_sql, where_params)
+        return rows, total
 
-    rows = db_tx_core(auth.conn, _query)
+    rows, total = db_tx_core(auth.conn, _query)
+    response.headers["Content-Range"] = content_range(qp.offset, len(rows), total)
     return {"attributes": rows}
 
 
 # ===========================================================================
-# POST /v1/attributes — create/upsert an attribute
+# POST /v1/attributes — create/upsert one attribute (object) or many (array)
 # ===========================================================================
 
 
 @router.post("/v1/attributes")
 async def create_attribute(auth: Auth, request: Request):
-    body = await request.json()
+    # A JSON array bulk-upserts; every item runs through the same idempotent
+    # facade (upsert on target+attr_name) in ONE transaction (all-or-nothing).
+    items, is_batch = as_items(await request.json())
 
     def _create(conn):
-        return svpor_create_attribute(conn, body)
+        return [svpor_create_attribute(conn, item) for item in items]
 
-    attr = db_tx_core(auth.conn, _create)
-    return JSONResponse(status_code=201, content={"attribute": attr})
+    created = db_tx_core(auth.conn, _create)
+    if is_batch:
+        return JSONResponse(status_code=201, content={"attributes": created})
+    return JSONResponse(status_code=201, content={"attribute": created[0]})
 
 
 # ===========================================================================

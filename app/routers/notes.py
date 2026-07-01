@@ -15,14 +15,36 @@ Default type: 'note'. Type 'issue' enables close/reopen workflow.
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Query, Request
+from fastapi import APIRouter, Request, Response
 from fastapi.responses import JSONResponse
 
 from app.auth import Auth
 from app.database import db_exec, db_one, db_query
 from app.errors import json_error
+from app.helpers.query import Col, QuerySpec, build_where, content_range, parse_query, resolve_total, wants_count
 
 router = APIRouter()
+
+
+# ---------------------------------------------------------------------------
+# Query spec — allowlist for the PostgREST-style grammar on GET /v1/notes.
+# Legacy ?type= (exact memory_kind) and ?q= (substring) are kept for back-compat.
+# ---------------------------------------------------------------------------
+
+NOTE_QUERY = QuerySpec(
+    columns={
+        "id": Col("memory_id", int),
+        "title": Col("title", str),
+        "body": Col("summary", str),
+        "type": Col("memory_kind", str),
+        "project_id": Col("(payload_jsonb->>'project_id')::bigint", int),
+        "issue_closed_at": Col("issue_closed_at", str),
+        "created_at": Col("created_at", str),
+    },
+    default_order=[("created_at", "desc nulls last"), ("id", "desc")],
+    default_limit=50,
+    max_limit=200,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -54,40 +76,36 @@ def _load_note(auth: Auth, note_id: int) -> dict | None:
 
 
 @router.get("/v1/notes")
-def list_notes(
-    auth: Auth,
-    type: str | None = Query(default=None, alias="type", max_length=60),
-    q: str | None = Query(default=None, max_length=200),
-    limit: int = Query(default=50, le=200),
-):
-    clauses: list[str] = []
-    params: list = []
-    if type:
-        clauses.append("memory_kind = %s")
-        params.append(type)
+def list_notes(auth: Auth, request: Request, response: Response):
+    params = request.query_params
+    # ?type= is the memory_kind spec column (bare value = exact-match, op grammar works).
+    qp = parse_query(params, NOTE_QUERY, reserved=("q",))
+    where_params = list(qp.where_params)
+
+    # Back-compat: ?q= substring search over title + summary.
+    q_clause = ""
+    q = params.get("q")
     if q:
-        clauses.append("(title ILIKE %s OR summary ILIKE %s)")
-        params.extend([f"%{q}%", f"%{q}%"])
+        q_clause = "(title ILIKE %s OR summary ILIKE %s)"
+        where_params += [f"%{q}%", f"%{q}%"]
 
-    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    where_sql = build_where(qp.where_clause, q_clause)
 
-    sql = f"""SELECT memory_id   AS id,
-                     title,
-                     summary     AS body,
-                     memory_kind AS type,
-                     (payload_jsonb->>'project_id')::bigint AS project_id,
-                     issue_closed_at,
-                     created_at
+    sql = f"""SELECT {qp.select_list}
                 FROM maludb_memory
-                {where}
-               ORDER BY created_at DESC NULLS LAST, memory_id DESC
-               LIMIT %s"""
-    params.append(limit)
+                {where_sql}
+                {qp.order_sql}
+                {qp.limit_sql}"""
 
-    rows = db_query(auth.conn, sql, params)
+    rows = db_query(auth.conn, sql, where_params + qp.limit_params)
     for r in rows:
-        r["id"] = int(r["id"])
-        r["project_id"] = None if r["project_id"] is None else int(r["project_id"])
+        if r.get("id") is not None:
+            r["id"] = int(r["id"])
+        if "project_id" in r:
+            r["project_id"] = None if r["project_id"] is None else int(r["project_id"])
+
+    total = resolve_total(auth.conn, wants_count(request), "maludb_memory", where_sql, where_params)
+    response.headers["Content-Range"] = content_range(qp.offset, len(rows), total)
 
     return {"notes": rows}
 

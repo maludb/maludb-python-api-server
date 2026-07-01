@@ -40,21 +40,26 @@ def shape_attribute(row: dict[str, Any]) -> None:
     and decode the JSON string columns (if still strings — psycopg v3 with
     dict_row may auto-decode jsonb columns).
     """
+    # Guard each cast on key presence so a ?select= projection that drops a
+    # column stays dropped (rather than re-added as None) and never KeyErrors.
     for key in ("id", "target_id"):
-        val = row.get(key)
-        row[key] = int(val) if val is not None else None
+        if key in row:
+            val = row[key]
+            row[key] = int(val) if val is not None else None
 
     for key in ("value_numeric", "confidence"):
-        val = row.get(key)
-        row[key] = float(val) if val is not None else None
+        if key in row:
+            val = row[key]
+            row[key] = float(val) if val is not None else None
 
     for key in ("value_jsonb", "metadata"):
-        val = row.get(key)
-        if val is None:
-            row[key] = None
-        elif isinstance(val, str):
-            row[key] = json.loads(val)
-        # else: already decoded by psycopg (dict) — leave as-is
+        if key in row:
+            val = row[key]
+            if val is None:
+                row[key] = None
+            elif isinstance(val, str):
+                row[key] = json.loads(val)
+            # else: already decoded by psycopg (dict) — leave as-is
 
     # value_range (tstzrange) is left as its text form.
 

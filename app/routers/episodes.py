@@ -18,13 +18,14 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from fastapi import APIRouter, Query, Request
+from fastapi import APIRouter, Request, Response
 from fastapi.responses import JSONResponse
 
 from app.auth import Auth
 from app.database import db_exec, db_one, db_query, db_tx_core
 from app.errors import json_error
 from app.helpers.attributes import attach_attributes
+from app.helpers.query import Col, QuerySpec, build_where, content_range, parse_query, resolve_total, wants_count
 from app.helpers.statements import STATEMENT_COLS, shape_statement, svpor_create_statement
 
 router = APIRouter()
@@ -38,6 +39,31 @@ EPISODE_COLS = """episode_id AS id, episode_kind AS kind, title, summary,
                   sensitivity, lifecycle_state, provenance, created_at,
                   subject_id, canonical_name"""
 
+# Query spec — allowlist for the PostgREST-style grammar on GET /v1/episodes.
+# Mirrors EPISODE_COLS; legacy ?kind=/?provenance= (exact) and ?q= (substring)
+# are kept for back-compat.
+EPISODE_QUERY = QuerySpec(
+    columns={
+        "id": Col("episode_id", int),
+        "kind": Col("episode_kind", str),
+        "title": Col("title", str),
+        "summary": Col("summary", str),
+        "payload": Col("payload_jsonb", str),
+        "occurred_at": Col("occurred_at", str),
+        "occurred_until": Col("occurred_until", str),
+        "recorded_at": Col("recorded_at", str),
+        "sensitivity": Col("sensitivity", str),
+        "lifecycle_state": Col("lifecycle_state", str),
+        "provenance": Col("provenance", str),
+        "created_at": Col("created_at", str),
+        "subject_id": Col("subject_id", int),
+        "canonical_name": Col("canonical_name", str),
+    },
+    default_order=[("occurred_at", "desc nulls last"), ("id", "desc")],
+    default_limit=50,
+    max_limit=200,
+)
+
 
 def shape_episode(row: dict[str, Any]) -> None:
     """Normalize scalar types on an episode row *in place*.
@@ -45,15 +71,20 @@ def shape_episode(row: dict[str, Any]) -> None:
     Mirrors PHP's shape_episode(): cast id and subject_id to int,
     decode payload from JSON string (if still a string).
     """
-    row["id"] = int(row["id"])
-    row["subject_id"] = int(row["subject_id"]) if row["subject_id"] is not None else None
+    # Guard each cast on key presence so a ?select= projection that drops a
+    # column stays dropped (rather than re-added as None) and never KeyErrors.
+    if "id" in row:
+        row["id"] = int(row["id"])
+    if "subject_id" in row:
+        row["subject_id"] = int(row["subject_id"]) if row["subject_id"] is not None else None
     # Decode payload — psycopg v3 may auto-decode jsonb, so handle both cases.
-    payload = row.get("payload")
-    if payload is None:
-        row["payload"] = None
-    elif isinstance(payload, str):
-        row["payload"] = json.loads(payload)
-    # else: already decoded by psycopg (dict) — leave as-is
+    if "payload" in row:
+        payload = row["payload"]
+        if payload is None:
+            row["payload"] = None
+        elif isinstance(payload, str):
+            row["payload"] = json.loads(payload)
+        # else: already decoded by psycopg (dict) — leave as-is
 
 
 # ===========================================================================
@@ -62,46 +93,44 @@ def shape_episode(row: dict[str, Any]) -> None:
 
 
 @router.get("/v1/episodes")
-def list_episodes(
-    auth: Auth,
-    q: str | None = Query(default=None, max_length=200),
-    kind: str | None = Query(default=None, max_length=120),
-    provenance: str | None = Query(default=None, max_length=40),
-    limit: int = Query(default=50, le=200),
-    with_: str | None = Query(default=None, alias="with", max_length=40),
-):
+def list_episodes(auth: Auth, request: Request, response: Response):
+    params = request.query_params
+    # ?kind= (episode_kind) and ?provenance= are spec columns now: bare value =
+    # exact-match, op grammar works too. ?q= stays a substring shortcut over
+    # title+summary; ?with=attributes embeds attributes.
+    qp = parse_query(params, EPISODE_QUERY, reserved=("q", "with"))
+    where_params = list(qp.where_params)
+    count_kind = wants_count(request)
+
+    q_clause = ""
+    q = params.get("q")
+    if q:
+        q_clause = "(title ILIKE %s OR summary ILIKE %s)"
+        where_params += [f"%{q}%", f"%{q}%"]
+
+    where_sql = build_where(qp.where_clause, q_clause)
+    with_ = params.get("with")
+
     def _query(conn):
-        clauses: list[str] = []
-        params: list = []
-        if kind:
-            clauses.append("episode_kind = %s")
-            params.append(kind)
-        if provenance:
-            clauses.append("provenance = %s")
-            params.append(provenance)
-        if q:
-            clauses.append("(title ILIKE %s OR summary ILIKE %s)")
-            params.extend([f"%{q}%", f"%{q}%"])
-
-        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
-
-        sql = f"""SELECT {EPISODE_COLS}
+        sql = f"""SELECT {qp.select_list}
                     FROM maludb_episode
-                    {where}
-                   ORDER BY occurred_at DESC NULLS LAST, episode_id DESC
-                   LIMIT %s"""
-        params.append(limit)
+                    {where_sql}
+                    {qp.order_sql}
+                    {qp.limit_sql}"""
 
-        rows = db_query(conn, sql, params)
+        rows = db_query(conn, sql, where_params + qp.limit_params)
         for r in rows:
             shape_episode(r)
 
-        if with_ == "attributes":
+        # ?with=attributes keys on each row's `id`, so it needs `id` in the projection.
+        if with_ == "attributes" and (not rows or "id" in rows[0]):
             attach_attributes(conn, rows, "maludb_episode_with_attributes", "episode_id")
 
-        return rows
+        total = resolve_total(conn, count_kind, "maludb_episode", where_sql, where_params)
+        return rows, total
 
-    rows = db_tx_core(auth.conn, _query)
+    rows, total = db_tx_core(auth.conn, _query)
+    response.headers["Content-Range"] = content_range(qp.offset, len(rows), total)
     return {"episodes": rows}
 
 

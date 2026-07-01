@@ -16,7 +16,7 @@ from __future__ import annotations
 import hashlib
 import json
 
-from fastapi import APIRouter, File, Form, Query, Request, UploadFile
+from fastapi import APIRouter, File, Form, Request, Response, UploadFile
 from fastapi.responses import JSONResponse
 
 from app.auth import Auth
@@ -24,8 +24,32 @@ from app.database import db_exec, db_one, db_query, db_tx_core
 from app.errors import json_error
 from app.helpers.attributes import attach_attributes
 from app.helpers.documents import document_link_subject, document_unlink_subject
+from app.helpers.query import Col, QuerySpec, build_where, content_range, parse_query, resolve_total, wants_count
 
 router = APIRouter()
+
+
+# ---------------------------------------------------------------------------
+# Query spec — allowlist for the PostgREST-style grammar on GET /v1/documents.
+# `content_size` comes from the joined source-package row (see FROM below).
+# ---------------------------------------------------------------------------
+
+DOCUMENT_QUERY = QuerySpec(
+    columns={
+        "id": Col("d.document_id", int),
+        "title": Col("d.title", str),
+        "source_type": Col("d.source_type", str),
+        "media_type": Col("d.media_type", str),
+        "document_type": Col("d.document_type", str),
+        "primary_project_id": Col("d.primary_project_id", int),
+        "description": Col("d.metadata_jsonb->>'description'", str),
+        "content_size": Col("sp.content_size", int),
+        "created_at": Col("d.created_at", str),
+    },
+    default_order=[("created_at", "desc nulls last"), ("id", "desc")],
+    default_limit=50,
+    max_limit=200,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -101,42 +125,43 @@ def _load_document_detail(auth: Auth, document_id: int) -> dict | None:
 
 
 @router.get("/v1/documents")
-def list_documents(
-    auth: Auth,
-    q: str | None = Query(default=None, max_length=200),
-    limit: int = Query(default=50, le=200),
-    with_: str | None = Query(default=None, alias="with", max_length=40),
-):
-    where = ""
-    params: list = []
-    if q:
-        where = "WHERE d.title ILIKE %s"
-        params.append(f"%{q}%")
+def list_documents(auth: Auth, request: Request, response: Response):
+    params = request.query_params
+    qp = parse_query(params, DOCUMENT_QUERY, reserved=("q", "with"))
+    where_params = list(qp.where_params)
 
-    sql = f"""SELECT d.document_id              AS id,
-                     d.title,
-                     d.source_type,
-                     d.media_type,
-                     d.document_type,
-                     d.primary_project_id,
-                     d.metadata_jsonb->>'description' AS description,
-                     sp.content_size,
-                     d.created_at
+    # Back-compat: ?q= keeps its substring search over the title.
+    q_clause = ""
+    q = params.get("q")
+    if q:
+        q_clause = "d.title ILIKE %s"
+        where_params.append(f"%{q}%")
+
+    where_sql = build_where(qp.where_clause, q_clause)
+
+    sql = f"""SELECT {qp.select_list}
                 FROM maludb_document d
                 LEFT JOIN maludb_source_package sp ON sp.source_package_id = d.source_package_id
-                {where}
-               ORDER BY d.created_at DESC NULLS LAST, d.document_id DESC
-               LIMIT %s"""
-    params.append(limit)
+                {where_sql}
+                {qp.order_sql}
+                {qp.limit_sql}"""
 
-    rows = db_query(auth.conn, sql, params)
+    rows = db_query(auth.conn, sql, where_params + qp.limit_params)
     for r in rows:
-        r["id"] = int(r["id"])
-        r["content_size"] = int(r["content_size"]) if r["content_size"] is not None else None
-        r["primary_project_id"] = int(r["primary_project_id"]) if r["primary_project_id"] is not None else None
+        if r.get("id") is not None:
+            r["id"] = int(r["id"])
+        if "content_size" in r:
+            r["content_size"] = int(r["content_size"]) if r["content_size"] is not None else None
+        if "primary_project_id" in r:
+            r["primary_project_id"] = int(r["primary_project_id"]) if r["primary_project_id"] is not None else None
 
-    if with_ == "attributes":
+    # ?with=attributes keys on each row's `id`, so it needs `id` in the projection.
+    if params.get("with") == "attributes" and (not rows or "id" in rows[0]):
         attach_attributes(auth.conn, rows, "maludb_document_with_attributes", "document_id")
+
+    from_sql = "maludb_document d LEFT JOIN maludb_source_package sp ON sp.source_package_id = d.source_package_id"
+    total = resolve_total(auth.conn, wants_count(request), from_sql, where_sql, where_params)
+    response.headers["Content-Range"] = content_range(qp.offset, len(rows), total)
 
     return {"documents": rows}
 

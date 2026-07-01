@@ -14,14 +14,35 @@ No DELETE in v1.
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Query, Request
+from fastapi import APIRouter, Request, Response
 from fastapi.responses import JSONResponse
 
 from app.auth import Auth
 from app.database import db_exec, db_one, db_query
 from app.errors import json_error
+from app.helpers.query import Col, QuerySpec, build_where, content_range, parse_query, resolve_total, wants_count
 
 router = APIRouter()
+
+
+# ---------------------------------------------------------------------------
+# Query spec — allowlist for the PostgREST-style grammar on GET /v1/pools.
+# Tombstoned pools are always excluded (a permanent base predicate below).
+# ---------------------------------------------------------------------------
+
+POOL_QUERY = QuerySpec(
+    columns={
+        "id": Col("pool_id", int),
+        "name": Col("pool_name", str),
+        "description": Col("task_objective", str),
+        "lifecycle_state": Col("lifecycle_state", str),
+        "archived_at": Col("archived_at", str),
+        "created_at": Col("created_at", str),
+    },
+    default_order=[("name", "asc")],
+    default_limit=50,
+    max_limit=200,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -56,32 +77,34 @@ def _load_pool(auth: Auth, pool_id: int) -> dict | None:
 
 
 @router.get("/v1/pools")
-def list_pools(
-    auth: Auth,
-    q: str | None = Query(default=None, max_length=200),
-    limit: int = Query(default=50, le=200),
-):
-    where = "WHERE (lifecycle_state IS DISTINCT FROM 'tombstoned')"
-    params: list = []
+def list_pools(auth: Auth, request: Request, response: Response):
+    params = request.query_params
+    qp = parse_query(params, POOL_QUERY, reserved=("q",))
+    where_params = list(qp.where_params)
+
+    # Back-compat: ?q= keeps its substring search over name + objective.
+    q_clause = ""
+    q = params.get("q")
     if q:
-        where += " AND (pool_name ILIKE %s OR task_objective ILIKE %s)"
-        params = [f"%{q}%", f"%{q}%"]
+        q_clause = "(pool_name ILIKE %s OR task_objective ILIKE %s)"
+        where_params += [f"%{q}%", f"%{q}%"]
 
-    sql = f"""SELECT pool_id        AS id,
-                     pool_name      AS name,
-                     task_objective AS description,
-                     lifecycle_state,
-                     archived_at,
-                     created_at
+    # Tombstoned pools are never listed (permanent base predicate).
+    where_sql = build_where("(lifecycle_state IS DISTINCT FROM 'tombstoned')", qp.where_clause, q_clause)
+
+    sql = f"""SELECT {qp.select_list}
                 FROM maludb_memory_pool
-                {where}
-               ORDER BY pool_name
-               LIMIT %s"""
-    params.append(limit)
+                {where_sql}
+                {qp.order_sql}
+                {qp.limit_sql}"""
 
-    rows = db_query(auth.conn, sql, params)
+    rows = db_query(auth.conn, sql, where_params + qp.limit_params)
     for r in rows:
-        r["id"] = int(r["id"])
+        if r.get("id") is not None:
+            r["id"] = int(r["id"])
+
+    total = resolve_total(auth.conn, wants_count(request), "maludb_memory_pool", where_sql, where_params)
+    response.headers["Content-Range"] = content_range(qp.offset, len(rows), total)
 
     return {"pools": rows}
 
