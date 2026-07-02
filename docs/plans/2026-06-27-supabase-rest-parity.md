@@ -214,7 +214,7 @@ Ten findings, all addressed:
 10. PK reflection on POST now runs only for upserts; `_run_write` dedupes the
     representation/exec block; `_quote_alias` alias removed.
 
-Final state: 517 tests green (incl. 27 real-DB e2e), supabase-py compat
+Final state: 517 tests green (incl. 28 real-DB e2e), supabase-py compat
 verified.
 
 ## Progress
