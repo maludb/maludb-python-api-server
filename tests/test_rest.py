@@ -40,6 +40,7 @@ def make_table(name: str = "todos", pk: list[str] | None = None) -> TableInfo:
         default_limit=REST_DEFAULT_LIMIT,
         max_limit=REST_MAX_LIMIT,
         clamp_limit=True,
+        strict=True,
     )
     return TableInfo(
         name=name,
@@ -118,14 +119,19 @@ class TestSelectStar:
         qp = parse_query(QueryParams("select=*,name:title"), ti.spec)
         assert qp.selected == ["id", "title", "done", "meta", "tags", "name"]
 
-    def test_aliases_are_quoted(self):
+    def test_aliases_are_quoted_in_strict(self):
         """Reflected column names can be mixed-case or contain spaces — the SQL
-        alias must be quoted or Postgres case-folds / errors."""
-        spec = QuerySpec(columns={"userId": Col('"userId"', int), "user id": Col('"user id"', str)})
+        alias must be quoted or Postgres case-folds / errors. Lenient specs
+        keep the pre-existing bare-alias wire contract."""
+        spec = QuerySpec(columns={"userId": Col('"userId"', int), "user id": Col('"user id"', str)}, strict=True)
         qp = parse_query(QueryParams("select=*"), spec)
         assert qp.select_list == '"userId" AS "userId", "user id" AS "user id"'
         qp = parse_query(QueryParams(""), spec)  # default select
         assert qp.select_list == '"userId" AS "userId", "user id" AS "user id"'
+
+        lenient = QuerySpec(columns={"label": Col("s.label", str)})
+        qp = parse_query(QueryParams("select=Name:label"), lenient)
+        assert qp.select_list == "s.label AS Name"  # bare, case-folds as on main
 
 
 # ---------------------------------------------------------------------------
@@ -350,6 +356,20 @@ class TestSplitQuotedList:
     def test_space_before_quoted_token(self):
         assert split_quoted_list('a, "b,c"') == ["a", "b,c"]
 
+    def test_malformed_quoting_rejected(self):
+        """Misparsing malformed quotes would compile filters against values the
+        client never sent (e.g. deleting row 'b' from in.("a,b) — 400 instead."""
+        for raw in ('"a,b', '"a"b,c', 'a"b'):
+            with pytest.raises(APIError) as exc:
+                split_quoted_list(raw)
+            assert exc.value.status == 400, raw
+
+    def test_unbalanced_group_quote_rejected(self):
+        ti = make_table()
+        with pytest.raises(APIError) as exc:
+            parse_query(QueryParams('or=(title.eq."abc,done.is.true)'), ti.spec)
+        assert exc.value.status == 400
+
 
 class TestRound3Regressions:
     def test_in_list_unquotes_values(self):
@@ -359,21 +379,22 @@ class TestRound3Regressions:
         qp = parse_query(QueryParams('title=in.("a,b","2026-07-01T12:00:00Z",plain)'), ti.spec)
         assert qp.where_params == ["a,b", "2026-07-01T12:00:00Z", "plain"]
 
-    def test_unsupported_operator_rejected(self):
+    def test_unknown_operator_rejected_in_strict(self):
+        """Strict dialect: unimplemented/typo'd operators are a 400 — falling
+        through to a literal would silently match nothing (fatal on DELETE)."""
         ti = make_table()
-        for raw in ("tags=cs.{a}", "tags=ov.{a,b}", "tags=not.cs.{a}"):
+        for raw in ("tags=cs.{a}", "tags=ov.{a,b}", "tags=not.cs.{a}", "title=qe.x", "title=bare"):
             with pytest.raises(APIError) as exc:
                 parse_query(QueryParams(raw), ti.spec)
             assert exc.value.status == 400, raw
-            assert "not supported" in exc.value.message
 
-    def test_bare_value_matching_op_name_is_implicit_eq(self):
-        """?title=all must stay a literal eq filter (no dot = no operator) —
-        rejecting it would regress every pre-existing list endpoint."""
-        ti = make_table()
-        for raw in ("title=all", "title=any", "title=cs", "title=isdistinct"):
-            qp = parse_query(QueryParams(raw), ti.spec)
-            assert qp.where_params == [raw.split("=", 1)[1]], raw
+    def test_lenient_dialect_keeps_implicit_eq(self):
+        """The memory endpoints' contract is unchanged from main: bare values
+        and unknown dotted tokens are implicit-eq literals."""
+        lenient = QuerySpec(columns={"label": Col("s.label", str)})
+        for value in ("all", "any", "all.hands", "not.all.staff", "cs.{a}", "2026-07-01T12:00:00Z"):
+            qp = parse_query(QueryParams({"label": value}), lenient)
+            assert qp.where_params == [value], value
 
     def test_op_modifier_forms_rejected(self):
         """like(any)/eq(all) would compile to a literal match that silently

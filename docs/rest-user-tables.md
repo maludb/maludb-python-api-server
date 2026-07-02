@@ -38,6 +38,12 @@ router runs and use the house error envelope on both mounts.
 - Filters: `?col=op.value` with `eq neq gt gte lt lte like ilike match imatch
   in is fts plfts phfts wfts`, negation `not.`, repeated params (AND),
   `or=(…)` / `and=(…)` groups
+- The operator prefix is **required** (PostgREST semantics): a bare value or a
+  typo'd/unimplemented operator is a 400, never a literal that silently
+  matches nothing. Quoted values (`in.("a,b")`, `or=(title.eq."a b")`) use
+  PostgREST backslash escaping; malformed quoting is a 400. The hand-written
+  memory endpoints keep their pre-existing lenient grammar unchanged.
+- HEAD returns headers only (Content-Range computed via a count, no row fetch)
 - Projection: `?select=col,alias:col,*`
 - Ordering: `?order=col.desc.nullslast,…`
 - Pagination: `limit` / `offset` (default and max **1000** rows; an over-max

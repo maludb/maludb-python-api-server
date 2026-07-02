@@ -251,7 +251,16 @@ class TestRestFlavorE2E:
     def test_unsupported_operator_is_400_not_silent(self, client):
         r = client.delete(f"/rest/v1/{TABLE}?tags=cs.{{a}}")
         assert r.status_code == 400
-        assert "not supported" in r.json()["message"]
+        assert "operator" in r.json()["message"].lower()
+
+    def test_head_count_without_body(self, client):
+        client.post(f"/rest/v1/{TABLE}", json=[{"title": "hd 1"}, {"title": "hd 2"}, {"title": "hd 3"}])
+        r = client.head(
+            f"/rest/v1/{TABLE}?title=like.hd *&limit=1", headers={"Prefer": "count=exact"}
+        )
+        assert r.status_code == 200
+        assert r.headers["content-range"] == "0-0/3"  # 1 returned of 3 total
+        client.delete(f"/rest/v1/{TABLE}?title=like.hd *")
 
     def test_percent_column_name_works(self, client):
         import psycopg

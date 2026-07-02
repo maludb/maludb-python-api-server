@@ -217,6 +217,31 @@ Ten findings, all addressed:
 Final state: 517 tests green (incl. 28 real-DB e2e), supabase-py compat
 verified.
 
+### Fifth review round (high effort, 2026-07-02) — the dialect split
+
+Round 5 identified the structural root of the recurring findings: the shared
+grammar was leaking PostgREST behavior changes into the pre-existing memory
+endpoints (implicit-eq regressions, group unquoting, alias casing), while the
+lenient implicit-eq leaked INTO the strict surface (typo'd operators silently
+matching nothing). Fixed with an explicit dialect flag, `QuerySpec.strict`:
+
+- **Lenient (default; all memory routers)** — byte-for-byte the main contract:
+  implicit-eq fallback, quotes are literal characters, bare (case-folded)
+  aliases, plain comma-split in `in.()` and groups. The round-2/3 divergences
+  previously "accepted" on these endpoints are now simply gone.
+- **Strict (reflected user tables)** — PostgREST semantics: operator prefix
+  required (unknown/typo'd operator → 400, closing the whole silent-no-op
+  class, not a hand-curated denylist), PostgREST quoting with backslash
+  escapes in `in.()`/groups/`?columns=`, malformed or unbalanced quoting →
+  400, quoted aliases (exact JSON key case).
+
+Also from round 5: HEAD now runs a windowed count instead of fetching up to
+1000 discarded rows (honest Content-Length 0 + correct Content-Range); the
+four /rest handlers share one `_pgrst_route` decorator (wire-format guarantee
+can't be forgotten on future routes); `AuthContext` annotations added per
+CLAUDE.md. Final state: 520 tests green (incl. 30 real-DB e2e), supabase-py
+compat verified.
+
 ## Progress
 
 - **Phase 0 — done.** `app/helpers/query.py` (`QuerySpec`/`Col`/`parse_query`/`build_where`) + unit tests in `tests/test_query.py`.

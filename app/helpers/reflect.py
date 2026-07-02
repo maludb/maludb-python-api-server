@@ -136,6 +136,7 @@ def resolve_table(conn: psycopg.Connection, table: str, include_pk: bool = False
         default_limit=REST_DEFAULT_LIMIT,
         max_limit=REST_MAX_LIMIT,
         clamp_limit=True,  # PostgREST max-rows truncates; it never errors
+        strict=True,  # PostgREST dialect: operator required, quoting enforced
     )
     return TableInfo(
         name=table,

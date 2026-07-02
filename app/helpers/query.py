@@ -23,11 +23,20 @@ Supported grammar (a pragmatic subset of PostgREST):
     ordering    ?order=col[.asc|.desc][.nullsfirst|.nullslast],...
     pagination  ?limit=N&offset=M
 
-Not yet supported (raise a clear 400 ``bad_request``): array/range operators
-(cs/cd/ov and friends), op(any)/op(all) modifiers, JSON-path access, and nested
-``and``/``or`` groups. ``in.()`` and conditions inside ``or=()``/``and=()``
-accept PostgREST-quoted values (``in.("a,b",c)``, ``or=(title.eq."a b")``) with
-backslash escaping.
+Two dialects, selected by ``QuerySpec.strict``:
+
+- **Lenient** (default — the hand-written memory routers): the pre-existing
+  contract. Values without a known operator prefix are implicit-eq literals,
+  quotes are literal characters, aliases are spliced bare (case-folded).
+- **Strict** (the reflected user-table API): PostgREST semantics. An operator
+  prefix is required (an unknown/typo'd operator is a 400, never a silent
+  no-match literal); ``in.()`` and or=()/and=() conditions accept
+  PostgREST-quoted values with backslash escaping and malformed quoting is a
+  400; aliases are quoted so JSON keys keep their exact case.
+
+Not implemented in either dialect (400 in strict; implicit-eq in lenient):
+array/range operators (cs/cd/ov and friends), op(any)/op(all) modifiers,
+JSON-path access, and nested ``and``/``or`` groups.
 
 Malformed values, unknown columns, and unknown operators raise
 ``APIError("bad_request", …, 400)`` so the failure matches the standard JSON error
@@ -74,6 +83,16 @@ class QuerySpec:
     # True → an over-max ?limit= is clamped to max_limit (PostgREST/Supabase
     # max-rows behavior, used by the reflected user-table API); False → 422.
     clamp_limit: bool = False
+    # Grammar dialect. False (default, the hand-written memory routers): the
+    # lenient pre-existing contract — filter values without a known operator
+    # prefix are implicit-eq literals, quotes are literal characters, aliases
+    # are spliced bare. True (the reflected user-table API): PostgREST
+    # semantics — an operator prefix is REQUIRED (PostgREST has no implicit
+    # eq, so a typo'd operator can never silently compile to a no-match
+    # literal), quoted values/lists are unquoted with backslash escapes and
+    # malformed quoting is a 400, and aliases are quoted (reflected column
+    # names can be mixed-case or contain any character).
+    strict: bool = False
 
 
 @dataclass(frozen=True)
@@ -126,16 +145,14 @@ _FTS_OPS: dict[str, str] = {
 
 _IS_VALUES = {"null", "true", "false", "unknown"}
 
-# Operators known to the grammar. A value that does NOT begin with one of these
-# (as ``op.value``) is treated as an implicit ``eq`` exact match — so bare legacy
-# params (``?type=note``) and dotted literals (timestamps) still work.
+# Operators known to the grammar. In the lenient dialect, a value that does
+# NOT begin with one of these (as ``op.value``) is treated as an implicit
+# ``eq`` exact match — so bare legacy params (``?type=note``) and dotted
+# literals (timestamps) still work. In the strict dialect an operator prefix
+# is required, so an unknown/typo'd operator is a 400 instead of a literal
+# that silently matches nothing (fatal on a DELETE, which would report
+# success while deleting nothing).
 _KNOWN_OPS = frozenset(_SIMPLE_OPS) | frozenset(_FTS_OPS) | {"in", "is"}
-
-# PostgREST operators this grammar deliberately does NOT implement. They must
-# fail loudly: falling through to the implicit-eq would compile e.g.
-# ``tags=cs.{a}`` into ``tags = 'cs.{a}'`` — silently matching nothing, which
-# on a DELETE reads as success.
-_UNSUPPORTED_OPS = frozenset({"cs", "cd", "ov", "sl", "sr", "nxr", "nxl", "adj", "all", "any", "isdistinct"})
 # Operators that only make sense on a text column (pattern / regex / full-text).
 _TEXT_OPS = frozenset({"like", "ilike", "match", "imatch"}) | frozenset(_FTS_OPS)
 
@@ -185,13 +202,19 @@ def _coerce(api_name: str, col: Col, value: str):
 # ---------------------------------------------------------------------------
 
 
-def _parse_op(raw: str) -> tuple[bool, str, str | None, str]:
+def _parse_op(raw: str, strict: bool) -> tuple[bool, str, str | None, str]:
     """Split a raw filter value into ``(negate, op, lang, value)``.
 
-    Recognized forms: ``op.value``, ``op(lang).value``, and ``not.<op>…``. A value
-    that does NOT begin with a known operator token is treated as an implicit
-    ``eq`` (exact match) over the whole string — so bare legacy params
+    Recognized forms: ``op.value``, ``op(lang).value``, and ``not.<op>…``.
+
+    Lenient dialect: a value that does NOT begin with a known operator token is
+    an implicit ``eq`` (exact match) over the whole string — bare legacy params
     (``?type=note``) and dotted literals (e.g. timestamps) work unambiguously.
+
+    Strict dialect: the operator prefix is required (as in PostgREST). Falling
+    through to implicit-eq would turn any unknown/typo'd/unimplemented operator
+    (``qe.x``, ``cs.{a}``) into a literal that silently matches nothing — on the
+    generic write surface that reads as a successful DELETE of zero rows.
     """
     negate = False
     body = raw
@@ -216,15 +239,12 @@ def _parse_op(raw: str) -> tuple[bool, str, str | None, str]:
         lang = m.group(2) if m else None
         return negate, base, lang, value
 
-    # Reject operators PostgREST defines but we don't implement, including
-    # behind an unstripped ``not.`` — implicit-eq would silently match nothing.
-    # Only an ``op.value`` shape counts: a bare dot-less value that happens to
-    # equal an op name (?label=all) is still a legitimate implicit-eq literal.
-    probe = body[4:] if body.startswith("not.") else body
-    probe_tok, probe_dot, _ = probe.partition(".")
-    pm = _LANG_RE.match(probe_tok)
-    if probe_dot and (pm.group(1) if pm else probe_tok) in _UNSUPPORTED_OPS:
-        raise _bad(f"Operator '{pm.group(1) if pm else probe_tok}' is not supported.")
+    if strict:
+        raise _bad(
+            f"Expected '<operator>.<value>' with a supported operator "
+            f"(eq, neq, gt, gte, lt, lte, like, ilike, match, imatch, in, is, "
+            f"fts, plfts, phfts, wfts), got '{raw}'."
+        )
 
     # No recognized operator prefix → implicit eq over the entire value.
     return negate, "eq", None, body
@@ -239,13 +259,17 @@ def _unquote_value(value: str) -> str:
     return value
 
 
-def _build_condition(api_name: str, col: Col, raw: str, *, in_group: bool = False) -> tuple[str, list]:
+def _build_condition(
+    api_name: str, col: Col, raw: str, *, strict: bool = False, in_group: bool = False
+) -> tuple[str, list]:
     """Build one ``WHERE`` fragment + its params for ``col`` and a raw value.
 
-    ``in_group=True`` (or=()/and=() conditions) unquotes a quoted scalar value
-    the way PostgREST does; top-level filter values are always literal."""
-    negate, op, lang, value = _parse_op(raw)
-    if in_group and op != "in":
+    In the strict dialect, a quoted scalar value inside an or=()/and=() group
+    (``in_group=True``) is unquoted the way PostgREST does; in the lenient
+    dialect quotes are literal characters (the pre-existing contract). Top-level
+    filter values are literal in both dialects."""
+    negate, op, lang, value = _parse_op(raw, strict)
+    if strict and in_group and op != "in":
         value = _unquote_value(value)
 
     if op in _TEXT_OPS and col.type is not str:
@@ -262,7 +286,10 @@ def _build_condition(api_name: str, col: Col, raw: str, *, in_group: bool = Fals
         inner = value.strip()
         if inner.startswith("(") and inner.endswith(")"):
             inner = inner[1:-1]
-        items = split_quoted_list(inner)
+        if strict:
+            items = split_quoted_list(inner)
+        else:
+            items = [x.strip() for x in inner.split(",") if x.strip() != ""]
         if not items:
             raise _bad(f"Empty 'in' list for column '{api_name}'.")
         params = [_coerce(api_name, col, x) for x in items]
@@ -293,32 +320,78 @@ def _build_condition(api_name: str, col: Col, raw: str, *, in_group: bool = Fals
     return frag, params
 
 
-# One token of a PostgREST comma-separated list: a double-quoted value (which
-# may contain commas and backslash-escaped characters — supabase clients quote
-# any value containing , : ( or )) or a bare value up to the next comma.
-# Whitespace around a quoted token is tolerated (``in.(a, "b,c")``).
-_QUOTED_LIST_TOKEN = re.compile(r'\s*"((?:[^"\\]|\\.)*)"\s*|([^,]+)')
-
-
 def split_quoted_list(raw: str) -> list[str]:
     """Split a PostgREST list (``a,b`` / ``"a,b","c"``), honoring double quotes
-    and unquoting the items (PostgREST escaping: ``\\"`` and ``\\\\``). Used for
-    ``in.(…)`` values and, in the user-table router, ``?columns=``/
-    ``?on_conflict=`` names."""
+    and unquoting the items (PostgREST escaping: ``\\"`` and ``\\\\``).
+    Malformed quoting — an unterminated quote, or text adjacent to a closing
+    quote — is a 400: silently misparsing it would compile a filter against
+    values the client never sent. Used for strict-dialect ``in.(…)`` values
+    and, in the user-table router, ``?columns=``/``?on_conflict=`` names."""
     items: list[str] = []
-    for m in _QUOTED_LIST_TOKEN.finditer(raw):
-        if m.group(1) is not None:
-            items.append(re.sub(r"\\(.)", r"\1", m.group(1)))
+    i, n = 0, len(raw)
+    while i < n:
+        while i < n and raw[i] == " ":
+            i += 1
+        if i >= n:
+            break
+        if raw[i] == '"':
+            i += 1
+            buf: list[str] = []
+            while i < n and raw[i] != '"':
+                if raw[i] == "\\" and i + 1 < n:
+                    i += 1
+                buf.append(raw[i])
+                i += 1
+            if i >= n:
+                raise _bad("Unterminated quoted value in list.")
+            i += 1  # closing quote
+            while i < n and raw[i] == " ":
+                i += 1
+            if i < n and raw[i] != ",":
+                raise _bad("Malformed list: unexpected text after a quoted value.")
+            items.append("".join(buf))
         else:
-            token = m.group(2).strip()
+            j = raw.find(",", i)
+            if j == -1:
+                j = n
+            token = raw[i:j].strip()
+            if '"' in token:
+                raise _bad("Malformed list: quotes must wrap the whole value.")
             if token:
                 items.append(token)
+            i = j
+        if i < n and raw[i] == ",":
+            i += 1
     return items
 
 
 def _split_top(s: str) -> list[str]:
-    """Split on top-level commas, respecting parentheses and double-quoted
-    values (for ``or``/``and`` groups — a quoted value may contain commas)."""
+    """Split on top-level commas, respecting parentheses (for ``or``/``and``
+    groups in the lenient dialect, where quotes are literal characters)."""
+    parts: list[str] = []
+    depth = 0
+    buf: list[str] = []
+    for ch in s:
+        if ch == "(":
+            depth += 1
+            buf.append(ch)
+        elif ch == ")":
+            depth -= 1
+            buf.append(ch)
+        elif ch == "," and depth == 0:
+            parts.append("".join(buf))
+            buf = []
+        else:
+            buf.append(ch)
+    if buf:
+        parts.append("".join(buf))
+    return parts
+
+
+def _split_top_quoted(s: str) -> list[str]:
+    """Strict-dialect ``_split_top``: double-quoted values (with backslash
+    escapes) may contain commas/parentheses; an unbalanced quote is a 400 —
+    silently swallowing the separators would collapse the group's conditions."""
     parts: list[str] = []
     depth = 0
     in_quotes = False
@@ -345,6 +418,8 @@ def _split_top(s: str) -> list[str]:
             buf = []
         else:
             buf.append(ch)
+    if in_quotes:
+        raise _bad("Unbalanced quote in group.")
     if buf:
         parts.append("".join(buf))
     return parts
@@ -356,7 +431,7 @@ def _build_bool_group(raw: str, spec: QuerySpec, kw: str) -> tuple[str, list]:
     s = raw.strip()
     if s.startswith("(") and s.endswith(")"):
         s = s[1:-1]
-    conds = _split_top(s)
+    conds = _split_top_quoted(s) if spec.strict else _split_top(s)
     parts: list[str] = []
     params: list = []
     for cond in conds:
@@ -366,7 +441,7 @@ def _build_bool_group(raw: str, spec: QuerySpec, kw: str) -> tuple[str, list]:
         col = spec.columns.get(name)
         if col is None:
             raise _bad(f"Unknown column '{name}' in '{label}' group.")
-        frag, p = _build_condition(name, col, rest, in_group=True)
+        frag, p = _build_condition(name, col, rest, strict=spec.strict, in_group=True)
         parts.append(frag)
         params.extend(p)
     if not parts:
@@ -402,6 +477,14 @@ def quote_ident(name: str) -> str:
     return ('"' + name.replace('"', '""') + '"').replace("%", "%%")
 
 
+def _alias_sql(name: str, spec: QuerySpec) -> str:
+    """Render one output alias. Strict dialect: quoted — reflected column
+    names can be mixed-case or contain any character, and quoting preserves
+    the exact JSON key (PostgREST behavior). Lenient dialect: spliced bare,
+    the pre-existing wire contract (Postgres case-folds unquoted aliases)."""
+    return quote_ident(name) if spec.strict else name
+
+
 def _build_select(value: str, spec: QuerySpec) -> tuple[str, list[str]]:
     pieces: list[str] = []
     selected: list[str] = []
@@ -413,19 +496,23 @@ def _build_select(value: str, spec: QuerySpec) -> tuple[str, list[str]]:
             # PostgREST wildcard — every spec column (supabase clients send
             # ?select=* by default).
             for name, col in spec.columns.items():
-                pieces.append(f"{col.expr} AS {quote_ident(name)}")
+                pieces.append(f"{col.expr} AS {_alias_sql(name, spec)}")
                 selected.append(name)
             continue
         if ":" in item:
             alias, name = item.split(":", 1)
         else:
             alias = name = item
-        if ":" in item and not _IDENT_RE.match(alias):
+        # A client-supplied name is spliced as the alias: in the lenient
+        # dialect it goes in bare, so it must be a plain identifier; in the
+        # strict dialect quoting makes any name safe, but a plain-form item
+        # is already validated by the column lookup below.
+        if (":" in item or not spec.strict) and not _IDENT_RE.match(alias):
             raise _bad(f"Invalid column alias '{alias}'.")
         col = spec.columns.get(name)
         if col is None:
             raise _bad(f"Unknown column '{name}' in select.")
-        pieces.append(f"{col.expr} AS {quote_ident(alias)}")
+        pieces.append(f"{col.expr} AS {_alias_sql(alias, spec)}")
         selected.append(alias)
     if not pieces:
         raise _bad("Empty select list.")
@@ -434,7 +521,7 @@ def _build_select(value: str, spec: QuerySpec) -> tuple[str, list[str]]:
 
 def _default_select(spec: QuerySpec) -> tuple[str, list[str]]:
     names = spec.default_select if spec.default_select is not None else list(spec.columns.keys())
-    pieces = [f"{spec.columns[n].expr} AS {quote_ident(n)}" for n in names]
+    pieces = [f"{spec.columns[n].expr} AS {_alias_sql(n, spec)}" for n in names]
     return ", ".join(pieces), list(names)
 
 
@@ -503,7 +590,7 @@ def parse_query(query_params, spec: QuerySpec, *, reserved: tuple[str, ...] = ()
             # Unknown keys are ignored, not rejected — matches the prior lenient
             # contract (e.g. the ?debug=1 SQL trace, cache-busters, tracking params).
             continue
-        frag, p = _build_condition(key, col, raw)
+        frag, p = _build_condition(key, col, raw, strict=spec.strict)
         where_parts.append(frag)
         where_params.extend(p)
 

@@ -45,13 +45,16 @@ headers, CSV bodies.
 
 from __future__ import annotations
 
+import functools
+import inspect
+
 import psycopg
 from fastapi import APIRouter, Request, Response
 from fastapi.responses import JSONResponse
 from psycopg.types.json import Jsonb
 
-from app.auth import Auth
-from app.database import db_exec, db_query
+from app.auth import Auth, AuthContext
+from app.database import db_exec, db_one, db_query
 from app.errors import APIError, _pg_error_message, classify_database_error, json_error
 from app.helpers.query import (
     ParsedQuery,
@@ -392,7 +395,7 @@ def _write_window(request: Request, max_limit: int) -> tuple[int | None, int | N
     return limit, offset
 
 
-def _run_write(auth, sql: str, params: list, representation: bool) -> tuple[list[dict] | None, int]:
+def _run_write(auth: AuthContext, sql: str, params: list, representation: bool) -> tuple[list[dict] | None, int]:
     """Execute a write statement: RETURNING rows when representation was
     requested, else just the affected-row count."""
     if representation:
@@ -401,25 +404,31 @@ def _run_write(auth, sql: str, params: list, representation: bool) -> tuple[list
     return None, db_exec(auth.conn, sql, params)
 
 
-def _get_core(auth, request: Request, response: Response, table: str):
-    """Shared read path: reflect, parse, select, count. Returns the row list."""
+def _get_core(auth: AuthContext, request: Request, response: Response, table: str) -> list[dict]:
+    """Shared read path: reflect, parse, select, count. Returns the row list.
+
+    HEAD discards the body (supabase's count-only ``head: true`` call), so it
+    fetches a single windowed count instead of materializing up to max-rows
+    rows — the count still drives Content-Range, and the empty body means
+    Content-Length is honestly 0 rather than the length of placeholder rows.
+    """
     ti = resolve_table(auth.conn, table)
     _check_known_keys(request.query_params, ti.spec)
     qp = parse_query(request.query_params, ti.spec, reserved=_RESERVED)
-    # HEAD discards the body (supabase's count-only head:true call) — fetch a
-    # constant instead of the row data; the row count still drives Content-Range.
-    is_head = request.method == "HEAD"
-    select_list = "1" if is_head else qp.select_list
-    sql = f"SELECT {select_list} FROM {ti.ident} {qp.where_sql} {qp.order_sql} {qp.limit_sql}"
-    rows = db_query(auth.conn, sql, qp.where_params + qp.limit_params)
-    if not is_head:
-        rows = _encode_rows(rows)
     total = resolve_total(auth.conn, wants_count(request), ti.ident, qp.where_sql, qp.where_params)
+    if request.method == "HEAD":
+        inner = f"SELECT 1 FROM {ti.ident} {qp.where_sql} {qp.limit_sql}"
+        row = db_one(auth.conn, f"SELECT count(*) AS n FROM ({inner}) w", qp.where_params + qp.limit_params)
+        returned = int(row["n"]) if row else 0
+        response.headers["Content-Range"] = content_range(qp.offset, returned, total)
+        return []
+    sql = f"SELECT {qp.select_list} FROM {ti.ident} {qp.where_sql} {qp.order_sql} {qp.limit_sql}"
+    rows = _encode_rows(db_query(auth.conn, sql, qp.where_params + qp.limit_params))
     response.headers["Content-Range"] = content_range(qp.offset, len(rows), total)
     return rows
 
 
-def _insert_core(auth, request: Request, table: str, body) -> tuple[list[dict] | None, int]:
+def _insert_core(auth: AuthContext, request: Request, table: str, body) -> tuple[list[dict] | None, int]:
     """Shared insert/upsert path. Returns ``(rows|None, affected)`` — rows only
     when ``Prefer: return=representation``."""
     resolution = wants_resolution(request)
@@ -446,7 +455,7 @@ def _insert_core(auth, request: Request, table: str, body) -> tuple[list[dict] |
     return _run_write(auth, sql, params, representation)
 
 
-def _update_core(auth, request: Request, table: str, body) -> tuple[list[dict] | None, int]:
+def _update_core(auth: AuthContext, request: Request, table: str, body) -> tuple[list[dict] | None, int]:
     """Shared update path. Returns ``(rows|None, affected)``."""
     ti = resolve_table(auth.conn, table)
     _check_known_keys(request.query_params, ti.spec)
@@ -460,7 +469,7 @@ def _update_core(auth, request: Request, table: str, body) -> tuple[list[dict] |
     return _run_write(auth, sql, params, representation)
 
 
-def _delete_core(auth, request: Request, table: str) -> tuple[list[dict] | None, int]:
+def _delete_core(auth: AuthContext, request: Request, table: str) -> tuple[list[dict] | None, int]:
     """Shared delete path. Returns ``(rows|None, affected)``."""
     ti = resolve_table(auth.conn, table)
     _check_known_keys(request.query_params, ti.spec)
@@ -515,7 +524,32 @@ def _pgrst_error(exc: Exception) -> JSONResponse:
 _PGRST_ERRORS = (APIError, psycopg.errors.DatabaseError)
 
 
-def _shape_write(auth, request: Request, run_core):
+def _pgrst_route(fn):
+    """Wrap a /rest/v1 handler so every APIError / DatabaseError leaves as a
+    PostgREST error body. Held in one place so a future handler can't forget
+    the wire-format guarantee by omitting a copy-pasted try/except."""
+    if inspect.iscoroutinefunction(fn):
+
+        @functools.wraps(fn)
+        async def async_wrapper(*args, **kwargs):
+            try:
+                return await fn(*args, **kwargs)
+            except _PGRST_ERRORS as exc:
+                return _pgrst_error(exc)
+
+        return async_wrapper
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except _PGRST_ERRORS as exc:
+            return _pgrst_error(exc)
+
+    return wrapper
+
+
+def _shape_write(auth: AuthContext, request: Request, run_core):
     """Run a write core, applying the ``.single()`` object contract.
 
     When the client demands a single object, the write and the cardinality
@@ -537,41 +571,33 @@ def _shape_write(auth, request: Request, run_core):
 
 
 @router_rest.api_route("/{table}", methods=["GET", "HEAD"])
+@_pgrst_route
 def rest_select(table: str, auth: Auth, request: Request, response: Response):
-    try:
-        rows = _get_core(auth, request, response, table)
-        return _single_object(rows) if wants_object(request) else rows
-    except _PGRST_ERRORS as exc:
-        return _pgrst_error(exc)
+    rows = _get_core(auth, request, response, table)
+    return _single_object(rows) if wants_object(request) else rows
 
 
 @router_rest.post("/{table}", status_code=201)
+@_pgrst_route
 async def rest_insert(table: str, auth: Auth, request: Request):
-    try:
-        body = await _read_json(request)
-        payload, _ = _shape_write(auth, request, lambda: _insert_core(auth, request, table, body))
-        return Response(status_code=201) if payload is None else payload
-    except _PGRST_ERRORS as exc:
-        return _pgrst_error(exc)
+    body = await _read_json(request)
+    payload, _ = _shape_write(auth, request, lambda: _insert_core(auth, request, table, body))
+    return Response(status_code=201) if payload is None else payload
 
 
 @router_rest.patch("/{table}")
+@_pgrst_route
 async def rest_update(table: str, auth: Auth, request: Request):
-    try:
-        body = await _read_json(request)
-        payload, _ = _shape_write(auth, request, lambda: _update_core(auth, request, table, body))
-        return Response(status_code=204) if payload is None else payload
-    except _PGRST_ERRORS as exc:
-        return _pgrst_error(exc)
+    body = await _read_json(request)
+    payload, _ = _shape_write(auth, request, lambda: _update_core(auth, request, table, body))
+    return Response(status_code=204) if payload is None else payload
 
 
 @router_rest.delete("/{table}")
+@_pgrst_route
 def rest_delete(table: str, auth: Auth, request: Request):
-    try:
-        payload, _ = _shape_write(auth, request, lambda: _delete_core(auth, request, table))
-        return Response(status_code=204) if payload is None else payload
-    except _PGRST_ERRORS as exc:
-        return _pgrst_error(exc)
+    payload, _ = _shape_write(auth, request, lambda: _delete_core(auth, request, table))
+    return Response(status_code=204) if payload is None else payload
 
 
 # ---------------------------------------------------------------------------
