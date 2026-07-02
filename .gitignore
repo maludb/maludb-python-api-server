@@ -9,3 +9,4 @@ build/
 data/*.db
 var/
 .ruff_cache/
+config/maludb.env

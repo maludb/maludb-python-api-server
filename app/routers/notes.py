@@ -147,7 +147,8 @@ async def create_note(auth: Auth, request: Request):
         """INSERT INTO maludb_memory (memory_kind, title, summary, payload_jsonb, recorded_at)
            VALUES (%s, %s, %s, %s::jsonb, now())
            RETURNING memory_id AS id, title, summary AS body, memory_kind AS type,
-                     issue_closed_at, created_at""",
+                     issue_closed_at::text AS issue_closed_at,
+                     created_at::text AS created_at""",
         [type_, title, text, payload],
     )
     note["id"] = int(note["id"])
