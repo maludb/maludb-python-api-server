@@ -172,26 +172,37 @@ def _known_column(ti: TableInfo, name: str, where: str) -> str:
 def _adapt(value, data_type: str | None):
     """Bind a JSON body value for the column's reflected type.
 
-    dicts are always jsonb; lists are jsonb only for json/jsonb columns —
-    for anything else (notably ARRAY columns) psycopg's native list→array
-    adaptation is what Postgres expects.
+    Every non-NULL value destined for a json/jsonb column binds as jsonb —
+    including scalars, which PostgREST stores as JSON strings/numbers (a bare
+    text/int param would be a Postgres type error). ``None`` stays SQL NULL.
+    dicts always bind as jsonb; other values for non-JSON columns pass through
+    (notably lists, where psycopg's native list→array adaptation is what an
+    ARRAY column expects).
     """
-    if isinstance(value, dict):
+    if value is not None and data_type in ("json", "jsonb"):
         return Jsonb(value)
-    if isinstance(value, list) and data_type in ("json", "jsonb"):
+    if isinstance(value, dict):
         return Jsonb(value)
     return value
 
 
+def _encode_value(value):
+    """bytea → PostgREST-style hex string (``\\x…``), recursing into arrays —
+    raw bytes would crash the strict-UTF-8 JSON encoder."""
+    if isinstance(value, (bytes, memoryview)):
+        return "\\x" + bytes(value).hex()
+    if isinstance(value, list):
+        return [_encode_value(v) for v in value]
+    return value
+
+
 def _encode_rows(rows: list[dict]) -> list[dict]:
-    """Post-process DB rows for JSON: bytea values become PostgREST-style hex
-    strings (``\\x…``) — raw bytes would crash the strict-UTF-8 JSON encoder.
+    """Post-process DB rows for JSON: encode bytea (incl. bytea[]) as hex.
     (Other types — datetime, UUID, Decimal — are handled by FastAPI's encoder;
     note Decimal→float is lossy past ~15 digits, a documented divergence.)"""
     for row in rows:
         for key, value in row.items():
-            if isinstance(value, (bytes, memoryview)):
-                row[key] = "\\x" + bytes(value).hex()
+            row[key] = _encode_value(value)
     return rows
 
 
@@ -360,34 +371,34 @@ def _single_object(rows: list[dict]):
     return rows[0]
 
 
-def _parse_window_int(raw: str, name: str, maximum: int | None) -> int:
-    try:
-        value = int(raw)
-    except ValueError:
-        json_error("bad_request", f"'{name}' must be an integer.", 400)
-    if value < 0:
-        json_error("bad_request", f"'{name}' must be >= 0.", 400)
-    if maximum is not None and value > maximum:
-        # A write must never be silently capped (a clamped DELETE would leave
-        # rows behind while reporting success) — reject instead.
-        json_error("bad_request", f"'{name}' must be <= {maximum} on writes.", 400)
-    return value
-
-
 def _write_window(request: Request, max_limit: int) -> tuple[int | None, int | None] | None:
-    """The client's explicit write window as validated ``(limit, offset)``.
+    """The client's explicit write window as ``(limit, offset)``.
 
     None when neither param is present (an empty value counts as absent) —
     parse_query always fills a default limit, which must NOT window an
-    unqualified bulk write; nor may the clamp used on reads apply here.
+    unqualified bulk write. Non-integer/negative values were already rejected
+    by parse_query (which runs first), so only the over-max check lives here:
+    the read-side clamp must never silently cap a write (a clamped DELETE
+    would leave rows behind while reporting success).
     """
     raw_limit = request.query_params.get("limit")
     raw_offset = request.query_params.get("offset")
-    limit = _parse_window_int(raw_limit, "limit", max_limit) if raw_limit else None
-    offset = _parse_window_int(raw_offset, "offset", None) if raw_offset else None
+    limit = int(raw_limit) if raw_limit else None
+    offset = int(raw_offset) if raw_offset else None
+    if limit is not None and limit > max_limit:
+        json_error("bad_request", f"'limit' must be <= {max_limit} on writes.", 400)
     if limit is None and offset is None:
         return None
     return limit, offset
+
+
+def _run_write(auth, sql: str, params: list, representation: bool) -> tuple[list[dict] | None, int]:
+    """Execute a write statement: RETURNING rows when representation was
+    requested, else just the affected-row count."""
+    if representation:
+        rows = _encode_rows(db_query(auth.conn, sql, params))
+        return rows, len(rows)
+    return None, db_exec(auth.conn, sql, params)
 
 
 def _get_core(auth, request: Request, response: Response, table: str):
@@ -395,8 +406,14 @@ def _get_core(auth, request: Request, response: Response, table: str):
     ti = resolve_table(auth.conn, table)
     _check_known_keys(request.query_params, ti.spec)
     qp = parse_query(request.query_params, ti.spec, reserved=_RESERVED)
-    sql = f"SELECT {qp.select_list} FROM {ti.ident} {qp.where_sql} {qp.order_sql} {qp.limit_sql}"
-    rows = _encode_rows(db_query(auth.conn, sql, qp.where_params + qp.limit_params))
+    # HEAD discards the body (supabase's count-only head:true call) — fetch a
+    # constant instead of the row data; the row count still drives Content-Range.
+    is_head = request.method == "HEAD"
+    select_list = "1" if is_head else qp.select_list
+    sql = f"SELECT {select_list} FROM {ti.ident} {qp.where_sql} {qp.order_sql} {qp.limit_sql}"
+    rows = db_query(auth.conn, sql, qp.where_params + qp.limit_params)
+    if not is_head:
+        rows = _encode_rows(rows)
     total = resolve_total(auth.conn, wants_count(request), ti.ident, qp.where_sql, qp.where_params)
     response.headers["Content-Range"] = content_range(qp.offset, len(rows), total)
     return rows
@@ -405,7 +422,10 @@ def _get_core(auth, request: Request, response: Response, table: str):
 def _insert_core(auth, request: Request, table: str, body) -> tuple[list[dict] | None, int]:
     """Shared insert/upsert path. Returns ``(rows|None, affected)`` — rows only
     when ``Prefer: return=representation``."""
-    ti = resolve_table(auth.conn, table, include_pk=True)
+    resolution = wants_resolution(request)
+    # The PK is only consulted as the default upsert conflict target — plain
+    # inserts skip the second catalog query.
+    ti = resolve_table(auth.conn, table, include_pk=resolution is not None)
     _check_insert_keys(request.query_params)
     items, _ = as_items(body)
     representation = wants_return(request) == "representation"
@@ -420,13 +440,10 @@ def _insert_core(auth, request: Request, table: str, body) -> tuple[list[dict] |
         items,
         request.query_params.get("columns"),
         request.query_params.get("on_conflict"),
-        wants_resolution(request),
+        resolution,
         qp.select_list if representation else None,
     )
-    if representation:
-        rows = _encode_rows(db_query(auth.conn, sql, params))
-        return rows, len(rows)
-    return None, db_exec(auth.conn, sql, params)
+    return _run_write(auth, sql, params, representation)
 
 
 def _update_core(auth, request: Request, table: str, body) -> tuple[list[dict] | None, int]:
@@ -440,10 +457,7 @@ def _update_core(auth, request: Request, table: str, body) -> tuple[list[dict] |
     sql, params = build_update_sql(
         ti, body, qp, qp.select_list if representation else None, window=_write_window(request, ti.spec.max_limit)
     )
-    if representation:
-        rows = _encode_rows(db_query(auth.conn, sql, params))
-        return rows, len(rows)
-    return None, db_exec(auth.conn, sql, params)
+    return _run_write(auth, sql, params, representation)
 
 
 def _delete_core(auth, request: Request, table: str) -> tuple[list[dict] | None, int]:
@@ -455,10 +469,7 @@ def _delete_core(auth, request: Request, table: str) -> tuple[list[dict] | None,
     sql, params = build_delete_sql(
         ti, qp, qp.select_list if representation else None, window=_write_window(request, ti.spec.max_limit)
     )
-    if representation:
-        rows = _encode_rows(db_query(auth.conn, sql, params))
-        return rows, len(rows)
-    return None, db_exec(auth.conn, sql, params)
+    return _run_write(auth, sql, params, representation)
 
 
 # ---------------------------------------------------------------------------

@@ -117,13 +117,14 @@ class TracerMiddleware(BaseHTTPMiddleware):
         response = await call_next(request)
 
         # Debug injection: if DEBUG_ENABLED and ?debug=1, inject meta.debug into JSON
-        # responses. Never on /rest/v1 — that mount is wire-compatible with PostgREST
-        # (bare arrays / bare row objects), and a phantom "meta" member would be read
-        # by supabase clients as row data (leaking the SQL trace into it).
+        # responses — but only on mounts that own the {"…", "meta": …} envelope.
+        # /rest/v1 is wire-compatible with PostgREST (bare arrays / bare row objects)
+        # and /mcp returns bare JSON-RPC bodies: a phantom "meta" member there would
+        # be read by the client as payload data (leaking the SQL trace into it).
         if (
             config.DEBUG_ENABLED
             and request.query_params.get("debug") == "1"
-            and not request.url.path.startswith("/rest/")
+            and not request.url.path.startswith(("/rest/", "/mcp"))
             and response.headers.get("content-type", "").startswith("application/json")
         ):
             # Read the response body

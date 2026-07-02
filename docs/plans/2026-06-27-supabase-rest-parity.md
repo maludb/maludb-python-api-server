@@ -189,6 +189,34 @@ Ten more findings, all addressed:
 Final state: 508 tests green (incl. 28 real-DB e2e), lint/format clean,
 supabase-py compat verified after each round.
 
+### Fourth review round (high effort, 2026-07-02)
+
+Ten findings, all addressed:
+1. **Regression from round 3**: the unsupported-op probe fired on bare
+   dot-less values (`?label=all` → 400 on every list endpoint) → the probe now
+   requires the `op.value` shape.
+2. Quoted values inside `or=()`/`and=()` bound their quotes literally →
+   group conditions unquote (backslash unescape), and `_split_top` respects
+   quotes so quoted commas survive the group split.
+3. `op(any)`/`op(all)` modifier forms compiled to literal matches (silent
+   no-op) → 400 for non-FTS parenthesized modifiers; `fts(lang)` unchanged.
+4. `split_quoted_list` used CSV doubled-quote escaping; PostgREST uses
+   backslashes → switched, plus whitespace tolerated before quoted tokens.
+5. JSON scalars for json/jsonb columns bound as text/int (Postgres type
+   error) → `_adapt` binds every non-NULL value as jsonb for JSON columns.
+6. `bytea[]` crashed serialization → `_encode_rows` recurses into arrays.
+7. HEAD ran the full data select → projects a constant (`SELECT 1`), keeping
+   Content-Range/count semantics.
+8. `_parse_window_int`'s int/negative validation was dead (parse_query runs
+   first) → removed; only the over-max-on-writes 400 remains.
+9. Debug-injection opt-out generalized to `/mcp` too (bare JSON-RPC bodies had
+   the same phantom-`meta` corruption — pre-existing bug).
+10. PK reflection on POST now runs only for upserts; `_run_write` dedupes the
+    representation/exec block; `_quote_alias` alias removed.
+
+Final state: 517 tests green (incl. 27 real-DB e2e), supabase-py compat
+verified.
+
 ## Progress
 
 - **Phase 0 — done.** `app/helpers/query.py` (`QuerySpec`/`Col`/`parse_query`/`build_where`) + unit tests in `tests/test_query.py`.

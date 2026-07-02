@@ -24,9 +24,10 @@ Supported grammar (a pragmatic subset of PostgREST):
     pagination  ?limit=N&offset=M
 
 Not yet supported (raise a clear 400 ``bad_request``): array/range operators
-(cs/cd/ov and friends), JSON-path access, quoted values inside ``or()``/``and()``
-groups, and nested ``and``/``or`` groups. ``in.()`` accepts PostgREST-quoted
-values (``in.("a,b",c)``).
+(cs/cd/ov and friends), op(any)/op(all) modifiers, JSON-path access, and nested
+``and``/``or`` groups. ``in.()`` and conditions inside ``or=()``/``and=()``
+accept PostgREST-quoted values (``in.("a,b",c)``, ``or=(title.eq."a b")``) with
+backslash escaping.
 
 Malformed values, unknown columns, and unknown operators raise
 ``APIError("bad_request", …, 400)`` so the failure matches the standard JSON error
@@ -207,24 +208,45 @@ def _parse_op(raw: str) -> tuple[bool, str, str | None, str]:
     m = _LANG_RE.match(op_tok)
     base = m.group(1) if m else op_tok
     if dot and base in _KNOWN_OPS:
+        if m and base not in _FTS_OPS:
+            # PostgREST's op(any)/op(all) modifiers — implemented only for the
+            # FTS language form. Letting e.g. like(any).{a*,b*} through would
+            # compile a literal LIKE '{a%,b%}' that silently matches nothing.
+            raise _bad(f"Operator modifier '({m.group(2)})' is not supported for '{base}'.")
         lang = m.group(2) if m else None
         return negate, base, lang, value
 
     # Reject operators PostgREST defines but we don't implement, including
     # behind an unstripped ``not.`` — implicit-eq would silently match nothing.
+    # Only an ``op.value`` shape counts: a bare dot-less value that happens to
+    # equal an op name (?label=all) is still a legitimate implicit-eq literal.
     probe = body[4:] if body.startswith("not.") else body
-    probe_tok = probe.partition(".")[0]
+    probe_tok, probe_dot, _ = probe.partition(".")
     pm = _LANG_RE.match(probe_tok)
-    if (pm.group(1) if pm else probe_tok) in _UNSUPPORTED_OPS:
+    if probe_dot and (pm.group(1) if pm else probe_tok) in _UNSUPPORTED_OPS:
         raise _bad(f"Operator '{pm.group(1) if pm else probe_tok}' is not supported.")
 
     # No recognized operator prefix → implicit eq over the entire value.
     return negate, "eq", None, body
 
 
-def _build_condition(api_name: str, col: Col, raw: str) -> tuple[str, list]:
-    """Build one ``WHERE`` fragment + its params for ``col`` and a raw value."""
+def _unquote_value(value: str) -> str:
+    """Strip PostgREST double quotes (with backslash unescaping) from a fully
+    quoted filter value — required inside or=()/and=() groups, where quoting is
+    how values containing commas/spaces survive the group split."""
+    if len(value) >= 2 and value.startswith('"') and value.endswith('"'):
+        return re.sub(r"\\(.)", r"\1", value[1:-1])
+    return value
+
+
+def _build_condition(api_name: str, col: Col, raw: str, *, in_group: bool = False) -> tuple[str, list]:
+    """Build one ``WHERE`` fragment + its params for ``col`` and a raw value.
+
+    ``in_group=True`` (or=()/and=() conditions) unquotes a quoted scalar value
+    the way PostgREST does; top-level filter values are always literal."""
     negate, op, lang, value = _parse_op(raw)
+    if in_group and op != "in":
+        value = _unquote_value(value)
 
     if op in _TEXT_OPS and col.type is not str:
         raise _bad(f"Operator '{op}' requires a text column, but '{api_name}' is not text.")
@@ -272,19 +294,21 @@ def _build_condition(api_name: str, col: Col, raw: str) -> tuple[str, list]:
 
 
 # One token of a PostgREST comma-separated list: a double-quoted value (which
-# may contain commas; supabase clients quote any value containing , : ( or ))
-# or a bare value up to the next comma.
-_QUOTED_LIST_TOKEN = re.compile(r'"((?:[^"]|"")*)"|([^,]+)')
+# may contain commas and backslash-escaped characters — supabase clients quote
+# any value containing , : ( or )) or a bare value up to the next comma.
+# Whitespace around a quoted token is tolerated (``in.(a, "b,c")``).
+_QUOTED_LIST_TOKEN = re.compile(r'\s*"((?:[^"\\]|\\.)*)"\s*|([^,]+)')
 
 
 def split_quoted_list(raw: str) -> list[str]:
     """Split a PostgREST list (``a,b`` / ``"a,b","c"``), honoring double quotes
-    and unquoting the items. Used for ``in.(…)`` values and, in the user-table
-    router, ``?columns=``/``?on_conflict=`` names."""
+    and unquoting the items (PostgREST escaping: ``\\"`` and ``\\\\``). Used for
+    ``in.(…)`` values and, in the user-table router, ``?columns=``/
+    ``?on_conflict=`` names."""
     items: list[str] = []
     for m in _QUOTED_LIST_TOKEN.finditer(raw):
         if m.group(1) is not None:
-            items.append(m.group(1).replace('""', '"'))
+            items.append(re.sub(r"\\(.)", r"\1", m.group(1)))
         else:
             token = m.group(2).strip()
             if token:
@@ -293,18 +317,30 @@ def split_quoted_list(raw: str) -> list[str]:
 
 
 def _split_top(s: str) -> list[str]:
-    """Split on top-level commas, respecting parentheses (for ``or`` groups)."""
+    """Split on top-level commas, respecting parentheses and double-quoted
+    values (for ``or``/``and`` groups — a quoted value may contain commas)."""
     parts: list[str] = []
     depth = 0
+    in_quotes = False
+    escaped = False
     buf: list[str] = []
     for ch in s:
-        if ch == "(":
+        if escaped:
+            buf.append(ch)
+            escaped = False
+        elif in_quotes and ch == "\\":
+            buf.append(ch)
+            escaped = True
+        elif ch == '"':
+            in_quotes = not in_quotes
+            buf.append(ch)
+        elif not in_quotes and ch == "(":
             depth += 1
             buf.append(ch)
-        elif ch == ")":
+        elif not in_quotes and ch == ")":
             depth -= 1
             buf.append(ch)
-        elif ch == "," and depth == 0:
+        elif not in_quotes and ch == "," and depth == 0:
             parts.append("".join(buf))
             buf = []
         else:
@@ -330,7 +366,7 @@ def _build_bool_group(raw: str, spec: QuerySpec, kw: str) -> tuple[str, list]:
         col = spec.columns.get(name)
         if col is None:
             raise _bad(f"Unknown column '{name}' in '{label}' group.")
-        frag, p = _build_condition(name, col, rest)
+        frag, p = _build_condition(name, col, rest, in_group=True)
         parts.append(frag)
         params.extend(p)
     if not parts:
@@ -366,9 +402,6 @@ def quote_ident(name: str) -> str:
     return ('"' + name.replace('"', '""') + '"').replace("%", "%%")
 
 
-_quote_alias = quote_ident
-
-
 def _build_select(value: str, spec: QuerySpec) -> tuple[str, list[str]]:
     pieces: list[str] = []
     selected: list[str] = []
@@ -380,7 +413,7 @@ def _build_select(value: str, spec: QuerySpec) -> tuple[str, list[str]]:
             # PostgREST wildcard — every spec column (supabase clients send
             # ?select=* by default).
             for name, col in spec.columns.items():
-                pieces.append(f"{col.expr} AS {_quote_alias(name)}")
+                pieces.append(f"{col.expr} AS {quote_ident(name)}")
                 selected.append(name)
             continue
         if ":" in item:
@@ -392,7 +425,7 @@ def _build_select(value: str, spec: QuerySpec) -> tuple[str, list[str]]:
         col = spec.columns.get(name)
         if col is None:
             raise _bad(f"Unknown column '{name}' in select.")
-        pieces.append(f"{col.expr} AS {_quote_alias(alias)}")
+        pieces.append(f"{col.expr} AS {quote_ident(alias)}")
         selected.append(alias)
     if not pieces:
         raise _bad("Empty select list.")
@@ -401,7 +434,7 @@ def _build_select(value: str, spec: QuerySpec) -> tuple[str, list[str]]:
 
 def _default_select(spec: QuerySpec) -> tuple[str, list[str]]:
     names = spec.default_select if spec.default_select is not None else list(spec.columns.keys())
-    pieces = [f"{spec.columns[n].expr} AS {_quote_alias(n)}" for n in names]
+    pieces = [f"{spec.columns[n].expr} AS {quote_ident(n)}" for n in names]
     return ", ".join(pieces), list(names)
 
 

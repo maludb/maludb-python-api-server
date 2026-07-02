@@ -291,6 +291,25 @@ class TestAdaptAndInsertKeys:
         _, params = build_insert_sql(ti, [{"meta": {"k": 1}}], None, None, None, None)
         assert isinstance(params[0], Jsonb)
 
+    def test_scalar_into_jsonb_column_wrapped(self):
+        """PostgREST stores JSON scalars into json/jsonb columns — a bare text
+        param would be a Postgres type error."""
+        ti = make_table()
+        _, params = build_insert_sql(ti, [{"meta": "hello"}], None, None, None, None)
+        assert isinstance(params[0], Jsonb)
+        _, params = build_insert_sql(ti, [{"meta": 5}], None, None, None, None)
+        assert isinstance(params[0], Jsonb)
+
+    def test_null_into_jsonb_stays_sql_null(self):
+        _, params = build_insert_sql(make_table(), [{"meta": None}], None, None, None, None)
+        assert params == [None]
+
+    def test_bytea_array_encoded(self):
+        from app.routers.rest import _encode_rows
+
+        rows = [{"blobs": [b"\x89P", b"\xff"], "plain": b"\x01"}]
+        assert _encode_rows(rows) == [{"blobs": ["\\x8950", "\\xff"], "plain": "\\x01"}]
+
     def test_insert_rejects_filter_params(self):
         with pytest.raises(APIError) as exc:
             _check_insert_keys(QueryParams("id=eq.5"))
@@ -323,8 +342,13 @@ class TestSplitQuotedList:
     def test_quoted_name_containing_comma(self):
         assert split_quoted_list('"a,b","title"') == ["a,b", "title"]
 
-    def test_doubled_quotes_unescaped(self):
-        assert split_quoted_list('"we""ird"') == ['we"ird']
+    def test_backslash_escapes_unescaped(self):
+        # PostgREST escaping is backslash-based: \" and \\
+        assert split_quoted_list('"Say \\"hi\\""') == ['Say "hi"']
+        assert split_quoted_list('"a\\\\b"') == ["a\\b"]
+
+    def test_space_before_quoted_token(self):
+        assert split_quoted_list('a, "b,c"') == ["a", "b,c"]
 
 
 class TestRound3Regressions:
@@ -342,6 +366,43 @@ class TestRound3Regressions:
                 parse_query(QueryParams(raw), ti.spec)
             assert exc.value.status == 400, raw
             assert "not supported" in exc.value.message
+
+    def test_bare_value_matching_op_name_is_implicit_eq(self):
+        """?title=all must stay a literal eq filter (no dot = no operator) —
+        rejecting it would regress every pre-existing list endpoint."""
+        ti = make_table()
+        for raw in ("title=all", "title=any", "title=cs", "title=isdistinct"):
+            qp = parse_query(QueryParams(raw), ti.spec)
+            assert qp.where_params == [raw.split("=", 1)[1]], raw
+
+    def test_op_modifier_forms_rejected(self):
+        """like(any)/eq(all) would compile to a literal match that silently
+        matches nothing — they must 400 until implemented."""
+        ti = make_table()
+        for raw in ("title=like(any).{a*,b*}", "title=eq(all).{1,2}"):
+            with pytest.raises(APIError) as exc:
+                parse_query(QueryParams(raw), ti.spec)
+            assert exc.value.status == 400, raw
+
+    def test_fts_language_form_still_works(self):
+        ti = make_table()
+        qp = parse_query(QueryParams("title=fts(english).cat"), ti.spec)
+        assert "to_tsvector(%s" in qp.where_clause
+        assert qp.where_params == ["english", "english", "cat"]
+
+    def test_group_values_unquoted(self):
+        """Quoted values inside or=()/and=() groups must be unquoted like
+        PostgREST does (quoting is how commas/spaces survive the group split)."""
+        ti = make_table()
+        qp = parse_query(QueryParams('or=(title.eq."a b",title.eq.plain)'), ti.spec)
+        assert qp.where_params == ["a b", "plain"]
+        qp = parse_query(QueryParams('and=(title.neq."x,y")'), ti.spec)
+        assert qp.where_params == ["x,y"]
+
+    def test_top_level_filter_value_stays_literal(self):
+        ti = make_table()
+        qp = parse_query(QueryParams('title=eq."quoted"'), ti.spec)
+        assert qp.where_params == ['"quoted"']  # PostgREST: top-level values are raw
 
     def test_quote_ident_escapes_percent(self):
         """A lone % in spliced SQL is a psycopg placeholder error — reflected
