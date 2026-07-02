@@ -39,6 +39,7 @@ from app.routers import (
     objects,
     pools,
     projects,
+    rest,
     skills,
     statements,
     subjects,
@@ -72,6 +73,8 @@ app.include_router(notes.router)
 app.include_router(objects.router)
 app.include_router(pools.router)
 app.include_router(projects.router)
+app.include_router(rest.router_rest)
+app.include_router(rest.router_tables)
 app.include_router(skills.router)
 app.include_router(statements.router)
 app.include_router(subjects.router)
@@ -113,10 +116,15 @@ class TracerMiddleware(BaseHTTPMiddleware):
 
         response = await call_next(request)
 
-        # Debug injection: if DEBUG_ENABLED and ?debug=1, inject meta.debug into JSON responses
+        # Debug injection: if DEBUG_ENABLED and ?debug=1, inject meta.debug into JSON
+        # responses — but only on mounts that own the {"…", "meta": …} envelope.
+        # /rest/v1 is wire-compatible with PostgREST (bare arrays / bare row objects)
+        # and /mcp returns bare JSON-RPC bodies: a phantom "meta" member there would
+        # be read by the client as payload data (leaking the SQL trace into it).
         if (
             config.DEBUG_ENABLED
             and request.query_params.get("debug") == "1"
+            and not request.url.path.startswith(("/rest/", "/mcp"))
             and response.headers.get("content-type", "").startswith("application/json")
         ):
             # Read the response body
@@ -137,9 +145,15 @@ class TracerMiddleware(BaseHTTPMiddleware):
                         "endpoint": tracer.endpoint,
                         "queries": tracer.queries,
                     }
+                    # Carry over the original headers (e.g. Content-Range) —
+                    # content-length/type are recomputed for the new body.
+                    headers = {
+                        k: v for k, v in response.headers.items() if k.lower() not in ("content-length", "content-type")
+                    }
                     return JSONResponse(
                         content=data,
                         status_code=response.status_code,
+                        headers=headers,
                     )
             except (json.JSONDecodeError, UnicodeDecodeError):
                 pass

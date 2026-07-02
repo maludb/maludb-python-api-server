@@ -38,7 +38,7 @@ ruff format app/ tests/            # format
 
 ### Design Principles (carried from PHP)
 
-1. **SQL traceability.** Every SQL query is a literal string in the route handler. Given a URL, find the router file, read the SQL. No query builder, no ORM.
+1. **SQL traceability.** Every SQL query is a literal string in the route handler. Given a URL, find the router file, read the SQL. No query builder, no ORM. *One deliberate exception:* the generic user-table API (`app/routers/rest.py`) serves arbitrary tenant-created tables, which by definition can't have hand-written SQL — its statements are assembled from catalog-reflected identifiers in `app/helpers/reflect.py` + `app/helpers/query.py`.
 2. **One router per domain.** Each file in `app/routers/` is self-contained — all queries, models, and handlers for that resource live together.
 3. **Minimal dependencies.** Only what's needed. No framework-on-top-of-framework.
 4. **Learning-friendly.** Type hints everywhere. Each router reads top-to-bottom. No inheritance, no generic CRUD base.
@@ -76,6 +76,7 @@ app/
     ├── objects.py       # /v1/objects/{kind} (atomic create)
     ├── graph.py         # /v1/edges, /v1/graph/neighbors, /v1/graph/walk
     ├── memory.py        # /v1/memory/* (LLM + vector pipeline)
+    ├── rest.py          # /rest/v1/{table} + /v1/tables/{table} — generic user-table API (PostgREST/Supabase compatible)
     ├── mcp.py           # POST /mcp — MCP server (stateless Streamable HTTP, 8 tools)
     ├── llm_config.py    # /v1/llm/* (catalog, provider keys, task→model choices)
     ├── tokens.py        # /v1/tokens (self-service auth)
