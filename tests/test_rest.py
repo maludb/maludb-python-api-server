@@ -45,7 +45,6 @@ def make_table(name: str = "todos", pk: list[str] | None = None) -> TableInfo:
     return TableInfo(
         name=name,
         ident=quote_ident(name),
-        columns=columns,
         data_types=data_types,
         pk=pk if pk is not None else ["id"],
         spec=spec,
@@ -482,3 +481,46 @@ class TestHeterogeneousUpsert:
         # ignore-duplicates never updates, so heterogeneous is safe too
         sql, _ = build_insert_sql(ti, items, None, None, "ignore-duplicates", None)
         assert sql.endswith("DO NOTHING")
+
+    def test_merge_upsert_with_explicit_columns_allows_heterogeneous(self):
+        """?columns= is the client opting into DEFAULT-fill — PostgREST only
+        enforces key homogeneity when the columns param is absent (supabase-js
+        always sends it for array bodies)."""
+        ti = make_table()
+        items = [{"id": 1, "title": "a"}, {"id": 2}]
+        sql, _ = build_insert_sql(ti, items, '"id","title"', None, "merge-duplicates", None)
+        assert "ON CONFLICT" in sql and "DEFAULT" in sql
+
+
+class TestRound6Regressions:
+    def test_in_requires_parens_in_strict(self):
+        ti = make_table()
+        with pytest.raises(APIError) as exc:
+            parse_query(QueryParams("title=in.(draft"), ti.spec)
+        assert exc.value.status == 400
+        with pytest.raises(APIError):
+            parse_query(QueryParams("title=in.draft)"), ti.spec)
+
+    def test_lenient_ignores_op_modifier(self):
+        """Main's lenient contract: eq(any).x parses as eq with the modifier
+        ignored — it must not 400 on pre-existing endpoints."""
+        lenient = QuerySpec(columns={"label": Col("s.label", str)})
+        qp = parse_query(QueryParams("label=eq(any).note"), lenient)
+        assert qp.where_params == ["note"]
+
+    def test_strict_rejects_op_modifier(self):
+        ti = make_table()
+        with pytest.raises(APIError):
+            parse_query(QueryParams("title=eq(any).note"), ti.spec)
+
+    def test_prefer_token_word_boundaries(self):
+        from starlette.requests import Request as StarletteRequest
+
+        from app.helpers.query import prefer_token
+
+        def req(prefer: str):
+            return StarletteRequest({"type": "http", "query_string": b"", "headers": [(b"prefer", prefer.encode())]})
+
+        assert prefer_token(req("discount=exact"), "count", ("exact",)) is None
+        assert prefer_token(req("return=minimalistic"), "return", ("representation", "minimal")) is None
+        assert prefer_token(req("count=exact, return=minimal"), "count", ("exact",)) == "exact"

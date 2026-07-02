@@ -242,6 +242,28 @@ can't be forgotten on future routes); `AuthContext` annotations added per
 CLAUDE.md. Final state: 520 tests green (incl. 30 real-DB e2e), supabase-py
 compat verified.
 
+### Sixth review round (high effort, 2026-07-02)
+
+Five confirmed correctness bugs + cleanups, all addressed:
+1. merge-duplicates homogeneity check fired even with `?columns=`, rejecting
+   supabase-js bulk upserts (it always sends `?columns=` for arrays) → the
+   check now applies only when `?columns=` is absent, matching PostgREST.
+2. Strict `in.()` accepted a missing/unbalanced paren as part of the literal
+   (silent no-match) → the parenthesized form is required, else 400.
+3. The op(modifier) rejection ran in both dialects, narrowing the lenient
+   contract (`eq(any).x` 400'd; main parsed-and-ignored it) → strict-only.
+4. HEAD + `Accept: vnd.pgrst.object+json` always 406'd (cardinality check ran
+   against the deliberately empty HEAD body) → skipped for HEAD.
+5. `prefer_token` substring-matched (`Prefer: discount=exact` triggered a
+   count) → word-boundary anchors.
+Cleanups: all /rest handlers async (single-branch decorator), the RETURNING
+parse skipped on minimal inserts, `TableInfo` collapsed to one column map,
+`_GRAMMAR_KEYS` derived from the parser's reserved set, and CLAUDE.md amended
+with the deliberate SQL-literality carve-out for the generic router.
+
+Final state: 526 tests green (incl. 32 real-DB e2e), supabase-py compat
+verified.
+
 ## Progress
 
 - **Phase 0 — done.** `app/helpers/query.py` (`QuerySpec`/`Col`/`parse_query`/`build_where`) + unit tests in `tests/test_query.py`.

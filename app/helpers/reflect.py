@@ -16,7 +16,7 @@ Safety properties:
   both prefixes are additionally rejected by name before touching the catalog.
 - Every SQL identifier the router splices comes from the catalog rows returned
   here (quoted via ``quote_ident``), never from client input. Client-supplied
-  column names are resolved through ``TableInfo.columns`` or rejected.
+  column names are resolved through ``TableInfo.data_types`` or rejected.
 """
 
 from __future__ import annotations
@@ -57,8 +57,9 @@ class TableInfo:
 
     name: str  # catalog name, as stored
     ident: str  # quoted identifier for splicing into SQL
-    columns: dict[str, type]  # column name → Python type (insertion order = ordinal)
-    data_types: dict[str, str]  # column name → information_schema data_type ('ARRAY', 'jsonb', …)
+    data_types: dict[str, str]  # column name → information_schema data_type ('ARRAY', 'jsonb', …);
+    #                             insertion order = ordinal position; the single
+    #                             source of column membership (spec derives from it)
     pk: list[str]  # primary-key column names ([] if none or not reflected — see include_pk)
     spec: QuerySpec  # allowlist for parse_query
 
@@ -128,10 +129,9 @@ def resolve_table(conn: psycopg.Connection, table: str, include_pk: bool = False
         )
         pk = [r["attname"] for r in pk_rows]
 
-    columns = {r["column_name"]: _TYPE_MAP.get(r["data_type"], str) for r in cols}
     data_types = {r["column_name"]: r["data_type"] for r in cols}
     spec = QuerySpec(
-        columns={name: Col(quote_ident(name), typ) for name, typ in columns.items()},
+        columns={name: Col(quote_ident(name), _TYPE_MAP.get(dt, str)) for name, dt in data_types.items()},
         default_order=[],  # PostgREST applies no default ORDER BY
         default_limit=REST_DEFAULT_LIMIT,
         max_limit=REST_MAX_LIMIT,
@@ -141,7 +141,6 @@ def resolve_table(conn: psycopg.Connection, table: str, include_pk: bool = False
     return TableInfo(
         name=table,
         ident=quote_ident(table),
-        columns=columns,
         data_types=data_types,
         pk=pk,
         spec=spec,

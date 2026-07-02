@@ -34,9 +34,10 @@ Two dialects, selected by ``QuerySpec.strict``:
   PostgREST-quoted values with backslash escaping and malformed quoting is a
   400; aliases are quoted so JSON keys keep their exact case.
 
-Not implemented in either dialect (400 in strict; implicit-eq in lenient):
-array/range operators (cs/cd/ov and friends), op(any)/op(all) modifiers,
-JSON-path access, and nested ``and``/``or`` groups.
+Not implemented in either dialect: array/range operators (cs/cd/ov and
+friends — 400 in strict, implicit-eq in lenient), op(any)/op(all) modifiers
+(400 in strict, parsed-and-ignored in lenient as on main), JSON-path access,
+and nested ``and``/``or`` groups.
 
 Malformed values, unknown columns, and unknown operators raise
 ``APIError("bad_request", …, 400)`` so the failure matches the standard JSON error
@@ -231,10 +232,11 @@ def _parse_op(raw: str, strict: bool) -> tuple[bool, str, str | None, str]:
     m = _LANG_RE.match(op_tok)
     base = m.group(1) if m else op_tok
     if dot and base in _KNOWN_OPS:
-        if m and base not in _FTS_OPS:
+        if strict and m and base not in _FTS_OPS:
             # PostgREST's op(any)/op(all) modifiers — implemented only for the
             # FTS language form. Letting e.g. like(any).{a*,b*} through would
             # compile a literal LIKE '{a%,b%}' that silently matches nothing.
+            # Lenient dialect: the modifier is parsed and ignored, as on main.
             raise _bad(f"Operator modifier '({m.group(2)})' is not supported for '{base}'.")
         lang = m.group(2) if m else None
         return negate, base, lang, value
@@ -286,6 +288,10 @@ def _build_condition(
         inner = value.strip()
         if inner.startswith("(") and inner.endswith(")"):
             inner = inner[1:-1]
+        elif strict:
+            # PostgREST requires the parenthesized form; a stray/missing paren
+            # would otherwise become part of a literal that matches nothing.
+            raise _bad(f"'in' filter for '{api_name}' must be a parenthesized list: in.(a,b,…).")
         if strict:
             items = split_quoted_list(inner)
         else:
@@ -675,8 +681,10 @@ def build_where(*clauses: str) -> str:
 def prefer_token(request, key: str, values: tuple[str, ...]) -> str | None:
     """Extract one ``key=value`` preference from the ``Prefer:`` header,
     where ``value`` must be one of ``values``. Shared by count/return/
-    resolution parsing so the header grammar lives in one place."""
-    m = re.search(rf"{key}=({'|'.join(values)})", request.headers.get("prefer", ""))
+    resolution parsing so the header grammar lives in one place. Word
+    boundaries prevent substring misreads (``discount=exact``,
+    ``return=minimalistic``)."""
+    m = re.search(rf"\b{key}=({'|'.join(values)})\b", request.headers.get("prefer", ""))
     return m.group(1) if m else None
 
 

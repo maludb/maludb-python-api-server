@@ -46,7 +46,6 @@ headers, CSV bodies.
 from __future__ import annotations
 
 import functools
-import inspect
 
 import psycopg
 from fastapi import APIRouter, Request, Response
@@ -57,6 +56,7 @@ from app.auth import Auth, AuthContext
 from app.database import db_exec, db_one, db_query
 from app.errors import APIError, _pg_error_message, classify_database_error, json_error
 from app.helpers.query import (
+    _RESERVED_KEYS,
     ParsedQuery,
     content_range,
     parse_query,
@@ -107,10 +107,11 @@ async def _read_json(request: Request):
 # Strict query-key validation
 # ---------------------------------------------------------------------------
 
-# Keys the read grammar consumes, plus `debug` (the ?debug=1 SQL trace).
-# `debug` is also passed to parse_query as reserved= so a tenant column named
-# `debug` can never turn the trace flag into a silent filter.
-_GRAMMAR_KEYS = frozenset({"select", "order", "limit", "offset", "or", "and", "debug"})
+# Keys the read grammar consumes (derived from the parser's own reserved set,
+# so the two can't drift), plus `debug` (the ?debug=1 SQL trace). `debug` is
+# also passed to parse_query as reserved= so a tenant column named `debug` can
+# never turn the trace flag into a silent filter.
+_GRAMMAR_KEYS = frozenset(_RESERVED_KEYS | {"debug"})
 _RESERVED = ("debug",)
 
 # POST is not a filtered operation: only these keys are meaningful. `columns`
@@ -162,7 +163,7 @@ def _check_insert_keys(query_params) -> None:
 
 def _known_column(ti: TableInfo, name: str, where: str) -> str:
     """Validate a client-supplied column name against the reflected table."""
-    if name not in ti.columns:
+    if name not in ti.data_types:
         json_error("unknown_column", f"Could not find the '{name}' column of '{ti.name}' in {where}.", 400)
     return name
 
@@ -267,10 +268,13 @@ def build_insert_sql(
                 f"Upsert on '{ti.name}' needs '?on_conflict=' — the table has no primary key.",
                 400,
             )
-        if resolution == "merge-duplicates":
+        if resolution == "merge-duplicates" and columns_param is None:
             # A merge-upsert writes EVERY insert column of a conflicting row; a
             # row missing a key would overwrite the stored value with DEFAULT.
-            # PostgREST rejects heterogeneous bulk bodies for exactly this reason.
+            # PostgREST rejects heterogeneous bulk bodies for exactly this
+            # reason — but only when ?columns= is absent: an explicit column
+            # list (which supabase-js always sends for arrays) is the client
+            # opting into DEFAULT-filling missing keys.
             for item in items:
                 for c in cols:
                     if c not in item:
@@ -441,16 +445,20 @@ def _insert_core(auth: AuthContext, request: Request, table: str, body) -> tuple
     if not items:
         return ([] if representation else None), 0
 
-    # select list for RETURNING; control params reserved so a column named
-    # 'columns'/'on_conflict' can't shadow them.
-    qp = parse_query(request.query_params, ti.spec, reserved=_INSERT_RESERVED)
+    # The RETURNING select list is only needed for representation (or to
+    # validate an explicit ?select=); control params are reserved so a column
+    # named 'columns'/'on_conflict' can't shadow them.
+    returning = None
+    if representation or "select" in request.query_params:
+        qp = parse_query(request.query_params, ti.spec, reserved=_INSERT_RESERVED)
+        returning = qp.select_list if representation else None
     sql, params = build_insert_sql(
         ti,
         items,
         request.query_params.get("columns"),
         request.query_params.get("on_conflict"),
         resolution,
-        qp.select_list if representation else None,
+        returning,
     )
     return _run_write(auth, sql, params, representation)
 
@@ -527,22 +535,13 @@ _PGRST_ERRORS = (APIError, psycopg.errors.DatabaseError)
 def _pgrst_route(fn):
     """Wrap a /rest/v1 handler so every APIError / DatabaseError leaves as a
     PostgREST error body. Held in one place so a future handler can't forget
-    the wire-format guarantee by omitting a copy-pasted try/except."""
-    if inspect.iscoroutinefunction(fn):
-
-        @functools.wraps(fn)
-        async def async_wrapper(*args, **kwargs):
-            try:
-                return await fn(*args, **kwargs)
-            except _PGRST_ERRORS as exc:
-                return _pgrst_error(exc)
-
-        return async_wrapper
+    the wire-format guarantee by omitting a copy-pasted try/except. All /rest
+    handlers are async (the codebase norm), so one wrapper suffices."""
 
     @functools.wraps(fn)
-    def wrapper(*args, **kwargs):
+    async def wrapper(*args, **kwargs):
         try:
-            return fn(*args, **kwargs)
+            return await fn(*args, **kwargs)
         except _PGRST_ERRORS as exc:
             return _pgrst_error(exc)
 
@@ -572,9 +571,11 @@ def _shape_write(auth: AuthContext, request: Request, run_core):
 
 @router_rest.api_route("/{table}", methods=["GET", "HEAD"])
 @_pgrst_route
-def rest_select(table: str, auth: Auth, request: Request, response: Response):
+async def rest_select(table: str, auth: Auth, request: Request, response: Response):
     rows = _get_core(auth, request, response, table)
-    return _single_object(rows) if wants_object(request) else rows
+    if wants_object(request) and request.method != "HEAD":
+        return _single_object(rows)
+    return rows
 
 
 @router_rest.post("/{table}", status_code=201)
@@ -595,7 +596,7 @@ async def rest_update(table: str, auth: Auth, request: Request):
 
 @router_rest.delete("/{table}")
 @_pgrst_route
-def rest_delete(table: str, auth: Auth, request: Request):
+async def rest_delete(table: str, auth: Auth, request: Request):
     payload, _ = _shape_write(auth, request, lambda: _delete_core(auth, request, table))
     return Response(status_code=204) if payload is None else payload
 
@@ -606,7 +607,7 @@ def rest_delete(table: str, auth: Auth, request: Request):
 
 
 @router_tables.api_route("/{table}", methods=["GET", "HEAD"])
-def tables_select(table: str, auth: Auth, request: Request, response: Response):
+async def tables_select(table: str, auth: Auth, request: Request, response: Response):
     return {"rows": _get_core(auth, request, response, table)}
 
 
@@ -623,6 +624,6 @@ async def tables_update(table: str, auth: Auth, request: Request):
 
 
 @router_tables.delete("/{table}")
-def tables_delete(table: str, auth: Auth, request: Request):
+async def tables_delete(table: str, auth: Auth, request: Request):
     rows, affected = _delete_core(auth, request, table)
     return {"deleted": affected} if rows is None else {"rows": rows}

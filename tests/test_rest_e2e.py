@@ -253,11 +253,18 @@ class TestRestFlavorE2E:
         assert r.status_code == 400
         assert "operator" in r.json()["message"].lower()
 
+    def test_head_with_object_accept_is_not_406(self, client):
+        """HEAD + .single() Accept must return headers, not a cardinality 406
+        computed from the deliberately empty HEAD body."""
+        r = client.head(
+            f"/rest/v1/{TABLE}?title=eq.ship it",
+            headers={"Accept": "application/vnd.pgrst.object+json"},
+        )
+        assert r.status_code == 200
+
     def test_head_count_without_body(self, client):
         client.post(f"/rest/v1/{TABLE}", json=[{"title": "hd 1"}, {"title": "hd 2"}, {"title": "hd 3"}])
-        r = client.head(
-            f"/rest/v1/{TABLE}?title=like.hd *&limit=1", headers={"Prefer": "count=exact"}
-        )
+        r = client.head(f"/rest/v1/{TABLE}?title=like.hd *&limit=1", headers={"Prefer": "count=exact"})
         assert r.status_code == 200
         assert r.headers["content-range"] == "0-0/3"  # 1 returned of 3 total
         client.delete(f"/rest/v1/{TABLE}?title=like.hd *")
