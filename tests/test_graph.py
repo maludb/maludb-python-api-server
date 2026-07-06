@@ -26,6 +26,7 @@ _AUTH_PATHS = [
     ("GET", "/v1/graph/walk?kind=subject&id=1"),
     ("GET", "/v1/graph/path?source_kind=subject&source_id=1&target_kind=subject&target_id=2"),
     ("GET", "/v1/graph/stats"),
+    ("POST", "/v1/graph/import"),
 ]
 
 
@@ -135,3 +136,40 @@ class TestGraphRequiredParams:
         # ge/le bounds are enforced by FastAPI (422) before auth on some
         # dependency orderings; either way it must not reach the handler.
         assert r.status_code in (401, 422)
+
+
+class TestGraphImportHelpers:
+    """Pure-function tests for the import transformation helpers."""
+
+    def test_confidence_enum_mapping(self):
+        from app.routers.graph import _link_confidence
+
+        assert _link_confidence("EXTRACTED") == 1.0
+        assert _link_confidence("inferred") == 0.7
+        assert _link_confidence("Ambiguous") == 0.4
+        assert _link_confidence("nonsense") is None
+        assert _link_confidence(None) is None
+
+    def test_confidence_numeric_passthrough_clamped(self):
+        from app.routers.graph import _link_confidence
+
+        assert _link_confidence(0.9) == 0.9
+        assert _link_confidence(2) == 1.0
+        assert _link_confidence(-1) == 0.0
+
+    def test_clean_text_strips_controls_and_caps(self):
+        from app.routers.graph import _clean_text
+
+        assert _clean_text("a\x00b\x1fc", 10) == "abc"
+        assert _clean_text("  padded  ", 10) == "padded"
+        assert len(_clean_text("x" * 500, 256)) == 256
+
+    def test_namespace_regex(self):
+        from app.routers.graph import _NAMESPACE_RE
+
+        assert _NAMESPACE_RE.match("maludb-terminal")
+        assert _NAMESPACE_RE.match("repo.v2_x")
+        assert not _NAMESPACE_RE.match("-leading-dash")
+        assert not _NAMESPACE_RE.match("has/slash")
+        assert not _NAMESPACE_RE.match("")
+        assert not _NAMESPACE_RE.match("x" * 65)
