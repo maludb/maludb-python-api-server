@@ -28,6 +28,8 @@ _AUTH_PATHS = [
     ("GET", "/v1/graph/stats"),
     ("POST", "/v1/graph/import"),
     ("GET", "/v1/graph/query?q=test"),
+    ("POST", "/v1/datamodel/refresh"),
+    ("GET", "/v1/datamodel/describe?relation=x"),
     ("GET", "/v1/graph/god-nodes"),
     ("GET", "/v1/graph/surprises?namespace=ns"),
     ("GET", "/v1/communities"),
