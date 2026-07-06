@@ -24,6 +24,8 @@ _AUTH_PATHS = [
     ("GET", "/v1/edges"),
     ("GET", "/v1/graph/neighbors?kind=subject&id=1"),
     ("GET", "/v1/graph/walk?kind=subject&id=1"),
+    ("GET", "/v1/graph/path?source_kind=subject&source_id=1&target_kind=subject&target_id=2"),
+    ("GET", "/v1/graph/stats"),
 ]
 
 
@@ -115,4 +117,21 @@ class TestGraphRequiredParams:
             "/v1/graph/walk?kind=subject",
             headers={"Authorization": "Bearer bad_token_here"},
         )
+        assert r.status_code in (401, 422)
+
+    def test_path_missing_target(self):
+        r = client.get(
+            "/v1/graph/path?source_kind=subject&source_id=1",
+            headers={"Authorization": "Bearer bad_token_here"},
+        )
+        assert r.status_code in (401, 422)
+
+    def test_path_max_depth_out_of_range(self):
+        r = client.get(
+            "/v1/graph/path?source_kind=subject&source_id=1"
+            "&target_kind=subject&target_id=2&max_depth=33",
+            headers={"Authorization": "Bearer bad_token_here"},
+        )
+        # ge/le bounds are enforced by FastAPI (422) before auth on some
+        # dependency orderings; either way it must not reach the handler.
         assert r.status_code in (401, 422)

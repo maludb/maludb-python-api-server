@@ -1,11 +1,13 @@
 """
-Graph endpoints — edges, neighbors, walk.
+Graph endpoints — edges, neighbors, walk, path, stats.
 
 Ports PHP's edges.php, graph_neighbors.php, and graph_walk.php.
 
 - GET /v1/edges        — unified edge view over maludb_edge
 - GET /v1/graph/neighbors — one-hop neighbors via maludb_graph_neighbors()
 - GET /v1/graph/walk      — multi-hop BFS via maludb_graph_walk()
+- GET /v1/graph/path      — source→target paths via maludb_graph_path() (core ≥0.101.0)
+- GET /v1/graph/stats     — node/edge/rel/store aggregates over maludb_edge
 
 All queries run inside db_tx_core() so the maludb_core facade views resolve.
 """
@@ -166,3 +168,109 @@ def graph_walk(
         "direction": direction,
         "walk": rows,
     }
+
+
+# ===========================================================================
+# GET /v1/graph/path — source→target paths, shortest first
+# ===========================================================================
+
+
+@router.get("/v1/graph/path")
+def graph_path(
+    auth: Auth,
+    source_kind: str = Query(max_length=40),
+    source_id: int = Query(),
+    target_kind: str = Query(max_length=40),
+    target_id: int = Query(),
+    max_depth: int = Query(default=6, ge=1, le=32),
+    direction: str = Query(default="both", max_length=20),
+    rel: str | None = Query(default=None, max_length=400),
+):
+    if not source_kind:
+        json_error("missing_field", 'Query param "source_kind" is required.', 400)
+    if not target_kind:
+        json_error("missing_field", 'Query param "target_kind" is required.', 400)
+
+    def _query(conn):
+        if rel:
+            rel_list = [r.strip() for r in rel.split(",") if r.strip()]
+            sql = """SELECT depth, path
+                       FROM maludb_graph_path(%s, %s, %s, %s, %s, %s, %s::text[])"""
+            params = [source_kind, source_id, target_kind, target_id, max_depth, direction, rel_list]
+        else:
+            sql = """SELECT depth, path
+                       FROM maludb_graph_path(%s, %s, %s, %s, %s, %s)"""
+            params = [source_kind, source_id, target_kind, target_id, max_depth, direction]
+
+        rows = db_query(conn, sql, params)
+        for r in rows:
+            r["depth"] = int(r["depth"])
+            if r["path"] is None:
+                r["path"] = []
+        return rows
+
+    rows = db_tx_core(auth.conn, _query)
+    return {
+        "source_kind": source_kind,
+        "source_id": source_id,
+        "target_kind": target_kind,
+        "target_id": target_id,
+        "max_depth": max_depth,
+        "direction": direction,
+        "paths": rows,
+    }
+
+
+# ===========================================================================
+# GET /v1/graph/stats — aggregates over the unified edge view
+# ===========================================================================
+
+
+@router.get("/v1/graph/stats")
+def graph_stats(
+    auth: Auth,
+    top_rels: int = Query(default=25, ge=1, le=100),
+):
+    def _query(conn):
+        totals = db_query(
+            conn,
+            "SELECT count(*) AS edges FROM maludb_edge",
+        )[0]
+
+        nodes = db_query(
+            conn,
+            """SELECT count(*) AS nodes
+                 FROM (SELECT source_kind AS kind, source_id AS id FROM maludb_edge
+                       UNION
+                       SELECT target_kind, target_id FROM maludb_edge) endpoints""",
+        )[0]
+
+        by_store = db_query(
+            conn,
+            """SELECT edge_store, count(*) AS edges
+                 FROM maludb_edge
+                GROUP BY edge_store
+                ORDER BY edges DESC, edge_store""",
+        )
+
+        by_rel = db_query(
+            conn,
+            """SELECT rel, count(*) AS edges
+                 FROM maludb_edge
+                GROUP BY rel
+                ORDER BY edges DESC, rel NULLS LAST
+                LIMIT %s""",
+            [top_rels],
+        )
+
+        return {
+            "edges": int(totals["edges"]),
+            "nodes": int(nodes["nodes"]),
+            "by_store": {r["edge_store"]: int(r["edges"]) for r in by_store},
+            "top_rels": [
+                {"rel": r["rel"], "edges": int(r["edges"])} for r in by_rel
+            ],
+        }
+
+    stats = db_tx_core(auth.conn, _query)
+    return {"stats": stats}
