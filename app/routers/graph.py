@@ -8,6 +8,10 @@ Ports PHP's edges.php, graph_neighbors.php, and graph_walk.php.
 - GET /v1/graph/walk      — multi-hop BFS via maludb_graph_walk()
 - GET /v1/graph/path      — source→target paths via maludb_graph_path() (core ≥0.101.0)
 - GET /v1/graph/stats     — node/edge/rel/store aggregates over maludb_edge
+- GET /v1/graph/god-nodes — highest-degree nodes via maludb_graph_degree() (core ≥0.102.0)
+- GET /v1/graph/surprises — cross-community edges via maludb_graph_surprises() (core ≥0.102.0)
+- GET /v1/communities     — namespace community sets (core ≥0.102.0)
+- GET /v1/communities/{id}/members — community membership with labels
 
 All queries run inside db_tx_core() so the maludb_core facade views resolve.
 """
@@ -292,6 +296,145 @@ def graph_stats(
 
 
 # ===========================================================================
+# GET /v1/graph/god-nodes — highest-degree nodes
+# ===========================================================================
+
+
+@router.get("/v1/graph/god-nodes")
+def graph_god_nodes(
+    auth: Auth,
+    limit: int = Query(default=10, ge=1, le=1000),
+):
+    def _query(conn):
+        rows = db_query(
+            conn,
+            """SELECT object_kind, object_id, label, degree_out, degree_in, degree_total
+                 FROM maludb_graph_degree(%s)""",
+            [limit],
+        )
+        for r in rows:
+            r["object_id"] = int(r["object_id"])
+            for k in ("degree_out", "degree_in", "degree_total"):
+                r[k] = int(r[k])
+        return rows
+
+    rows = db_tx_core(auth.conn, _query)
+    return {"limit": limit, "god_nodes": rows}
+
+
+# ===========================================================================
+# GET /v1/graph/surprises — cross-community edges, rarest pair first
+# ===========================================================================
+
+
+@router.get("/v1/graph/surprises")
+def graph_surprises(
+    auth: Auth,
+    namespace: str = Query(max_length=64),
+    limit: int = Query(default=25, ge=1, le=200),
+):
+    if not namespace:
+        json_error("missing_field", 'Query param "namespace" is required.', 400)
+
+    def _query(conn):
+        rows = db_query(
+            conn,
+            """SELECT source_kind, source_id, source_label, source_community,
+                      rel, target_kind, target_id, target_label, target_community,
+                      community_pair_edges
+                 FROM maludb_graph_surprises(%s, %s)""",
+            [namespace, limit],
+        )
+        for r in rows:
+            for k in ("source_id", "target_id", "source_community", "target_community", "community_pair_edges"):
+                r[k] = int(r[k])
+        return rows
+
+    rows = db_tx_core(auth.conn, _query)
+    return {"namespace": namespace, "limit": limit, "surprises": rows}
+
+
+# ===========================================================================
+# GET /v1/communities — community sets with sizes
+# ===========================================================================
+
+
+@router.get("/v1/communities")
+def list_communities(
+    auth: Auth,
+    namespace: str | None = Query(default=None, max_length=64),
+):
+    def _query(conn):
+        clauses = ""
+        params: list = []
+        if namespace:
+            clauses = "WHERE c.namespace = %s"
+            params.append(namespace)
+        rows = db_query(
+            conn,
+            f"""SELECT c.community_id, c.namespace, c.community_key, c.label,
+                       c.algorithm, c.computed_at, count(m.membership_id) AS member_count
+                  FROM maludb_community c
+                  LEFT JOIN maludb_community_membership m ON m.community_id = c.community_id
+                  {clauses}
+                 GROUP BY c.community_id, c.namespace, c.community_key, c.label,
+                          c.algorithm, c.computed_at
+                 ORDER BY c.namespace, c.community_key""",
+            params,
+        )
+        for r in rows:
+            r["community_id"] = int(r["community_id"])
+            r["community_key"] = int(r["community_key"])
+            r["member_count"] = int(r["member_count"])
+            r["computed_at"] = r["computed_at"].isoformat()
+        return rows
+
+    rows = db_tx_core(auth.conn, _query)
+    return {"communities": rows}
+
+
+# ===========================================================================
+# GET /v1/communities/{community_id}/members
+# ===========================================================================
+
+
+@router.get("/v1/communities/{community_id}/members")
+def community_members(
+    auth: Auth,
+    community_id: int,
+    limit: int = Query(default=200, ge=1, le=2000),
+):
+    def _query(conn):
+        exists = db_query(
+            conn,
+            "SELECT community_id FROM maludb_community WHERE community_id = %s",
+            [community_id],
+        )
+        if not exists:
+            json_error("not_found", f"Community {community_id} not found.", 404)
+        rows = db_query(
+            conn,
+            """SELECT m.object_kind, m.object_id, m.score, s.canonical_name, s.aliases
+                 FROM maludb_community_membership m
+                 LEFT JOIN maludb_subject s
+                   ON m.object_kind = 'subject' AND s.subject_id = m.object_id
+                WHERE m.community_id = %s
+                ORDER BY m.object_id
+                LIMIT %s""",
+            [community_id, limit],
+        )
+        for r in rows:
+            r["object_id"] = int(r["object_id"])
+            r["score"] = float(r["score"]) if r["score"] is not None else None
+            aliases = r.pop("aliases", None) or []
+            r["label"] = aliases[0] if aliases else r["canonical_name"]
+        return rows
+
+    rows = db_tx_core(auth.conn, _query)
+    return {"community_id": community_id, "members": rows}
+
+
+# ===========================================================================
 # POST /v1/graph/import — bulk import of a Graphify node-link graph
 # ===========================================================================
 
@@ -432,14 +575,19 @@ async def graph_import(auth: Auth, request: Request):
 
     # ---- chunked ingest in one transaction --------------------------------
     def _import(conn):
-        # Subject types are a curated per-tenant catalog (no tenant-writable
-        # registration facade yet), so unseen node types fall back to a seeded
-        # generic; the declared type is preserved in the graphify_file_type /
-        # graphify_type attributes.
+        # Unseen node types are registered into the global subject-type
+        # catalog when the core is >= 0.102.0 (maludb_register_subject_type
+        # facade); on older cores they fall back to a seeded generic with the
+        # declared type preserved in the graphify_type attribute. Types that
+        # can't be expressed as a valid catalog name always fall back.
         catalog = {
             r["subject_type"]
             for r in db_query(conn, "SELECT subject_type FROM maludb_subject_type")
         }
+        can_register = db_query(
+            conn,
+            "SELECT to_regproc('maludb_register_subject_type') IS NOT NULL AS ok",
+        )[0]["ok"]
         fallback = next((t for t in ("concept", "other") if t in catalog), None)
         if fallback is None:
             json_error(
@@ -448,10 +596,27 @@ async def graph_import(auth: Auth, request: Request):
                 "('concept' or 'other') to map graph nodes onto.",
                 422,
             )
+        registrable = re.compile(r"^[a-z][a-z0-9_]{0,59}$")
         for subject in [root_subject, *subject_list]:
-            if subject["type"] not in catalog:
+            declared = subject["type"]
+            if declared in catalog:
+                continue
+            slug = re.sub(r"[^a-z0-9_]", "_", declared.lower())
+            if can_register and registrable.match(slug):
+                db_query(
+                    conn,
+                    "SELECT maludb_register_subject_type(%s) AS registered",
+                    [slug],
+                )
+                catalog.add(slug)
+                if slug != declared:
+                    subject.setdefault("attributes", []).append(
+                        {"attr_name": "graphify_type", "value_text": declared}
+                    )
+                subject["type"] = slug
+            else:
                 subject.setdefault("attributes", []).append(
-                    {"attr_name": "graphify_type", "value_text": subject["type"]}
+                    {"attr_name": "graphify_type", "value_text": declared}
                 )
                 subject["type"] = fallback
 
@@ -508,6 +673,47 @@ async def graph_import(auth: Auth, request: Request):
             ]
             _ingest({"subjects": resolve_subjects, "edges": chunk})
 
+        # Pass 3: communities. Graphify tags nodes with a community id at
+        # cluster time; store them first-class when the core has the
+        # 0.102.0 community facade (replace semantics per namespace).
+        by_community: dict[int, list[str]] = {}
+        for i, n in enumerate(nodes):
+            if not isinstance(n, dict):
+                continue
+            node_id = _clean_text(n.get("id") or "", 512)
+            if node_id not in subjects_by_id or n.get("community") is None:
+                continue
+            try:
+                key = int(n["community"])
+            except (TypeError, ValueError):
+                continue
+            by_community.setdefault(key, []).append(subjects_by_id[node_id]["name"])
+        if by_community:
+            has_facade = db_query(
+                conn,
+                "SELECT to_regproc('maludb_community_replace') IS NOT NULL AS ok",
+            )[0]["ok"]
+            if has_facade:
+                payload = [
+                    {"key": key, "members": members}
+                    for key, members in sorted(by_community.items())
+                ]
+                report = db_query(
+                    conn,
+                    "SELECT maludb_community_replace(%s, %s, %s::jsonb) AS report",
+                    [namespace, "louvain", json.dumps(payload)],
+                )[0]["report"]
+                totals["communities"] = {
+                    "stored": int(report.get("communities", 0)),
+                    "members": int(report.get("members", 0)),
+                }
+            else:
+                totals["communities"] = {
+                    "stored": 0,
+                    "members": 0,
+                    "note": "core lacks maludb_community_replace (needs >= 0.102.0)",
+                }
+
         return totals
 
     totals = db_tx_core(auth.conn, _import)
@@ -526,6 +732,7 @@ async def graph_import(auth: Auth, request: Request):
             "created": totals["edges_created"],
         },
         "verbs_created": totals["verbs_created"],
+        "communities": totals.get("communities"),
         "chunks": totals["chunks"],
         "skipped": skipped[:_MAX_SKIPPED_REPORTED],
     }
