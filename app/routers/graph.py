@@ -651,11 +651,16 @@ async def graph_import(auth: Auth, request: Request):
         )[0]["ok"]
         if not has_fn:
             return None
+        core_options = {"provenance": provenance}
+        if options.get("resolve_external") is True:
+            core_options["resolve_external"] = True
+        if isinstance(options.get("algorithm"), str):
+            core_options["algorithm"] = options["algorithm"]
         return db_query(
             conn,
             "SELECT maludb_graph_import(%s, %s::jsonb, %s::jsonb) AS report",
             [namespace, json.dumps({"nodes": nodes, "links": links}),
-             json.dumps({"provenance": provenance})],
+             json.dumps(core_options)],
         )[0]["report"]
 
     core_report = db_tx_core(auth.conn, _core_import)
@@ -911,3 +916,77 @@ async def graph_import(auth: Auth, request: Request):
         "chunks": totals["chunks"],
         "skipped": skipped[:_MAX_SKIPPED_REPORTED],
     }
+
+
+# ===========================================================================
+# Data-model graph (core >= 0.104.0): refresh + describe
+# ===========================================================================
+
+
+@router.post("/v1/datamodel/refresh")
+async def datamodel_refresh(auth: Auth, request: Request):
+    """
+    Introspect the tenant's database objects (tables, views, routines,
+    triggers, FKs, view dependencies) into the data-model graph namespace
+    via maludb_datamodel_refresh. Body (optional):
+    {"namespace": "datamodel", "schemas": ["maludb_core"]}.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    namespace = str(body.get("namespace") or "datamodel").strip()
+    schemas = body.get("schemas")
+    if schemas is not None and (
+        not isinstance(schemas, list) or not all(isinstance(s, str) for s in schemas)
+    ):
+        json_error("validation_failed", '"schemas" must be an array of schema names.', 422)
+
+    def _refresh(conn):
+        has_fn = db_query(
+            conn,
+            "SELECT to_regproc('maludb_datamodel_refresh') IS NOT NULL AS ok",
+        )[0]["ok"]
+        if not has_fn:
+            json_error(
+                "not_supported",
+                "maludb_datamodel_refresh is not available (requires maludb_core >= 0.104.0).",
+                409,
+            )
+        return db_query(
+            conn,
+            "SELECT maludb_datamodel_refresh(%s, %s::name[]) AS report",
+            [namespace, schemas],
+        )[0]["report"]
+
+    report = db_tx_core(auth.conn, _refresh)
+    return {"report": report}
+
+
+@router.get("/v1/datamodel/describe")
+def datamodel_describe(
+    auth: Auth,
+    relation: str = Query(min_length=1, max_length=200),
+):
+    """Live catalog description (columns, pk, FKs in/out) of one relation."""
+
+    def _describe(conn):
+        has_fn = db_query(
+            conn,
+            "SELECT to_regproc('maludb_datamodel_describe') IS NOT NULL AS ok",
+        )[0]["ok"]
+        if not has_fn:
+            json_error(
+                "not_supported",
+                "maludb_datamodel_describe is not available (requires maludb_core >= 0.104.0).",
+                409,
+            )
+        return db_query(
+            conn,
+            "SELECT maludb_datamodel_describe(%s) AS report",
+            [relation],
+        )[0]["report"]
+
+    return {"relation": relation, "describe": db_tx_core(auth.conn, _describe)}
