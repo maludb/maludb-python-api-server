@@ -296,6 +296,134 @@ def graph_stats(
 
 
 # ===========================================================================
+# GET /v1/graph/query — lexical seed + bounded walk (graphify-style query)
+# ===========================================================================
+
+
+@router.get("/v1/graph/query")
+def graph_query(
+    auth: Auth,
+    q: str = Query(min_length=1, max_length=400),
+    namespace: str | None = Query(default=None, max_length=64),
+    depth: int = Query(default=2, ge=1, le=6),
+    seeds: int = Query(default=3, ge=1, le=10),
+    max_nodes: int = Query(default=50, ge=1, le=500),
+):
+    """
+    Graphify-style graph question answering: tokenize the question, score
+    subjects by how many terms match their canonical name or aliases, walk
+    the unified graph from the top-scoring seeds, and return the merged
+    subgraph (nodes + the edges among them).
+    """
+    terms = [t for t in re.split(r"[^a-z0-9_]+", q.lower()) if len(t) >= 2]
+    if not terms:
+        json_error("validation_failed", 'Query param "q" has no searchable terms.', 422)
+    terms = terms[:12]
+
+    def _query(conn):
+        # ---- seed scoring: one point per matching term -------------------
+        score_expr = " + ".join(
+            "(CASE WHEN canonical_name ILIKE %s OR array_to_string(aliases, ' ') ILIKE %s THEN 1 ELSE 0 END)"
+            for _ in terms
+        )
+        params: list = []
+        for t in terms:
+            like = f"%{t}%"
+            params.extend([like, like])
+        ns_clause = ""
+        if namespace:
+            ns_clause = "AND (canonical_name LIKE %s OR canonical_name = %s)"
+            params.extend([f"{namespace}/%", namespace])
+        params.append(seeds)
+
+        like_params = params[: len(terms) * 2]
+        tail_params = params[len(terms) * 2 :]
+        seed_rows = db_query(
+            conn,
+            f"""SELECT subject_id, canonical_name, aliases, ({score_expr}) AS score
+                  FROM maludb_subject
+                 WHERE ({score_expr}) > 0
+                   {ns_clause}
+                 ORDER BY score DESC, subject_id
+                 LIMIT %s""",
+            like_params + like_params + tail_params,
+        )
+        if not seed_rows:
+            return {"seeds": [], "nodes": [], "edges": []}
+
+        # ---- walk from each seed, merge shallowest-depth-wins -------------
+        node_depth: dict[tuple[str, int], dict] = {}
+        for s in seed_rows:
+            sid = int(s["subject_id"])
+            node_depth.setdefault(("subject", sid), {
+                "object_kind": "subject",
+                "object_id": sid,
+                "label": (s["aliases"] or [s["canonical_name"]])[0],
+                "canonical_name": s["canonical_name"],
+                "depth": 0,
+            })
+            walk = db_query(
+                conn,
+                """SELECT object_kind, object_id, depth, label
+                     FROM maludb_graph_walk(%s, %s, %s, 'both')""",
+                ["subject", sid, depth],
+            )
+            for w in walk:
+                key = (w["object_kind"], int(w["object_id"]))
+                d = int(w["depth"])
+                if key not in node_depth or d < node_depth[key]["depth"]:
+                    node_depth[key] = {
+                        "object_kind": w["object_kind"],
+                        "object_id": int(w["object_id"]),
+                        "label": w["label"],
+                        "depth": d,
+                    }
+
+        nodes = sorted(node_depth.values(), key=lambda n: (n["depth"], n["object_id"]))[:max_nodes]
+        kept = {(n["object_kind"], n["object_id"]) for n in nodes}
+
+        # ---- edges among kept nodes (coarse id prefilter, exact kind+id
+        # check in Python since ids are only unique per kind) ---------------
+        kept_ids = sorted({n["object_id"] for n in nodes})
+        edge_rows = db_query(
+            conn,
+            """SELECT source_kind, source_id, rel, target_kind, target_id, confidence
+                 FROM maludb_edge
+                WHERE source_id = ANY(%s) AND target_id = ANY(%s)""",
+            [kept_ids, kept_ids],
+        )
+        edges = [
+            {
+                "source_kind": e["source_kind"],
+                "source_id": int(e["source_id"]),
+                "rel": e["rel"],
+                "target_kind": e["target_kind"],
+                "target_id": int(e["target_id"]),
+                "confidence": float(e["confidence"]) if e["confidence"] is not None else None,
+            }
+            for e in edge_rows
+            if (e["source_kind"], int(e["source_id"])) in kept
+            and (e["target_kind"], int(e["target_id"])) in kept
+        ]
+
+        return {
+            "seeds": [
+                {
+                    "subject_id": int(s["subject_id"]),
+                    "canonical_name": s["canonical_name"],
+                    "score": int(s["score"]),
+                }
+                for s in seed_rows
+            ],
+            "nodes": nodes,
+            "edges": edges,
+        }
+
+    result = db_tx_core(auth.conn, _query)
+    return {"query": q, "namespace": namespace, "depth": depth, **result}
+
+
+# ===========================================================================
 # GET /v1/graph/god-nodes — highest-degree nodes
 # ===========================================================================
 
@@ -511,7 +639,54 @@ async def graph_import(auth: Auth, request: Request):
 
     provenance = _clean_text(body.get("provenance") or "graphify", 200)
 
-    # ---- normalize nodes -------------------------------------------------
+    # ---- preferred path: one in-core call (core >= 0.103.0) ---------------
+    # maludb_graph_import owns the whole transformation (types, subjects,
+    # SVO edges, communities); this endpoint just validates HTTP input and
+    # relays the report. The client-side path below remains as a fallback
+    # for older cores.
+    def _core_import(conn):
+        has_fn = db_query(
+            conn,
+            "SELECT to_regproc('maludb_graph_import') IS NOT NULL AS ok",
+        )[0]["ok"]
+        if not has_fn:
+            return None
+        return db_query(
+            conn,
+            "SELECT maludb_graph_import(%s, %s::jsonb, %s::jsonb) AS report",
+            [namespace, json.dumps({"nodes": nodes, "links": links}),
+             json.dumps({"provenance": provenance})],
+        )[0]["report"]
+
+    core_report = db_tx_core(auth.conn, _core_import)
+    if core_report is not None:
+        n = core_report.get("nodes") or {}
+        e = core_report.get("edges") or {}
+        comm = core_report.get("communities")
+        return {
+            "namespace": namespace,
+            "nodes": {
+                "received": int(n.get("received") or 0),
+                "imported": int(n.get("received") or 0),
+                "created": int(n.get("created") or 0),
+                "resolved": int(n.get("resolved") or 0),
+            },
+            "edges": {
+                "received": int(e.get("received") or 0),
+                "imported": int(e.get("received") or 0),
+                "created": int(e.get("created") or 0),
+            },
+            "verbs_created": int(core_report.get("verbs_created") or 0),
+            "communities": (
+                {"stored": int(comm.get("communities") or 0),
+                 "members": int(comm.get("members") or 0)}
+                if comm else None
+            ),
+            "chunks": 1,
+            "skipped": (core_report.get("skipped") or [])[:_MAX_SKIPPED_REPORTED],
+        }
+
+    # ---- normalize nodes (fallback for core < 0.103.0) --------------------
     skipped: list[dict] = []
     subjects_by_id: dict[str, dict] = {}
     for i, n in enumerate(nodes):

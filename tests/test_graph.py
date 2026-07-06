@@ -27,6 +27,7 @@ _AUTH_PATHS = [
     ("GET", "/v1/graph/path?source_kind=subject&source_id=1&target_kind=subject&target_id=2"),
     ("GET", "/v1/graph/stats"),
     ("POST", "/v1/graph/import"),
+    ("GET", "/v1/graph/query?q=test"),
     ("GET", "/v1/graph/god-nodes"),
     ("GET", "/v1/graph/surprises?namespace=ns"),
     ("GET", "/v1/communities"),
