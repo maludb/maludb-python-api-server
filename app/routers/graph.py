@@ -639,7 +639,54 @@ async def graph_import(auth: Auth, request: Request):
 
     provenance = _clean_text(body.get("provenance") or "graphify", 200)
 
-    # ---- normalize nodes -------------------------------------------------
+    # ---- preferred path: one in-core call (core >= 0.103.0) ---------------
+    # maludb_graph_import owns the whole transformation (types, subjects,
+    # SVO edges, communities); this endpoint just validates HTTP input and
+    # relays the report. The client-side path below remains as a fallback
+    # for older cores.
+    def _core_import(conn):
+        has_fn = db_query(
+            conn,
+            "SELECT to_regproc('maludb_graph_import') IS NOT NULL AS ok",
+        )[0]["ok"]
+        if not has_fn:
+            return None
+        return db_query(
+            conn,
+            "SELECT maludb_graph_import(%s, %s::jsonb, %s::jsonb) AS report",
+            [namespace, json.dumps({"nodes": nodes, "links": links}),
+             json.dumps({"provenance": provenance})],
+        )[0]["report"]
+
+    core_report = db_tx_core(auth.conn, _core_import)
+    if core_report is not None:
+        n = core_report.get("nodes") or {}
+        e = core_report.get("edges") or {}
+        comm = core_report.get("communities")
+        return {
+            "namespace": namespace,
+            "nodes": {
+                "received": int(n.get("received") or 0),
+                "imported": int(n.get("received") or 0),
+                "created": int(n.get("created") or 0),
+                "resolved": int(n.get("resolved") or 0),
+            },
+            "edges": {
+                "received": int(e.get("received") or 0),
+                "imported": int(e.get("received") or 0),
+                "created": int(e.get("created") or 0),
+            },
+            "verbs_created": int(core_report.get("verbs_created") or 0),
+            "communities": (
+                {"stored": int(comm.get("communities") or 0),
+                 "members": int(comm.get("members") or 0)}
+                if comm else None
+            ),
+            "chunks": 1,
+            "skipped": (core_report.get("skipped") or [])[:_MAX_SKIPPED_REPORTED],
+        }
+
+    # ---- normalize nodes (fallback for core < 0.103.0) --------------------
     skipped: list[dict] = []
     subjects_by_id: dict[str, dict] = {}
     for i, n in enumerate(nodes):
