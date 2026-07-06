@@ -651,11 +651,16 @@ async def graph_import(auth: Auth, request: Request):
         )[0]["ok"]
         if not has_fn:
             return None
+        core_options = {"provenance": provenance}
+        if options.get("resolve_external") is True:
+            core_options["resolve_external"] = True
+        if isinstance(options.get("algorithm"), str):
+            core_options["algorithm"] = options["algorithm"]
         return db_query(
             conn,
             "SELECT maludb_graph_import(%s, %s::jsonb, %s::jsonb) AS report",
             [namespace, json.dumps({"nodes": nodes, "links": links}),
-             json.dumps({"provenance": provenance})],
+             json.dumps(core_options)],
         )[0]["report"]
 
     core_report = db_tx_core(auth.conn, _core_import)
