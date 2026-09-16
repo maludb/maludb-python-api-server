@@ -19,6 +19,7 @@ import json
 from typing import Any
 
 from fastapi import APIRouter, Request, Response
+from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
 
 from app.auth import Auth
@@ -195,7 +196,7 @@ async def create_episode(auth: Auth, request: Request):
     episode = db_tx_core(auth.conn, _create)
     shape_episode(episode)
 
-    return JSONResponse(status_code=201, content={"episode": episode})
+    return JSONResponse(status_code=201, content={"episode": jsonable_encoder(episode)})
 
 
 # ===========================================================================
