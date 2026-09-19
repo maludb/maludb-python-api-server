@@ -211,6 +211,14 @@ verb and a tenant role cannot enumerate its vector compartments.
 End-to-end tests: `MALUDB_AUTH_STORE=… MALUDB_E2E_TOKEN=malu_… pytest tests/test_agent_fleet_e2e.py`
 against a **scratch** tenant — they write and, memory being append-only, do not clean up.
 
+**Deleting a memory (0.2.1).** `DELETE /v1/documents/{id}` removes the document, its source package
+and its graph edges. Its **vector chunks stay in the engine**: they live in a core table no tenant
+role can reach, no facade removes them (maludb_core ≤ 0.105.x), and the exact-scan search path
+ignores tombstones. So `/v1/memory/search`, `/v1/memory/recall` and the MCP `search_memory` tool
+**drop any hit whose document no longer exists** (over-fetching ×3 so the limit is still filled,
+and renumbering `rank_no`). A deleted memory is never returned; its text is physically removed
+only once the extension deletes chunks with their document.
+
 ### Agent skills (maludb_core 0.97.0)
 
 `POST /v1/skills/ingest` registers a Claude Agent Skill bundle (SKILL.md +

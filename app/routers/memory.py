@@ -524,6 +524,24 @@ async def memory_search(auth: Auth, request: Request):
     )
 
 
+# A deleted document's vector chunks outlive it: DELETE /v1/documents/{id} removes the document
+# and its graph edges, but the chunks sit in a core table no tenant role can touch and no facade
+# removes (maludb_core <= 0.105.x), and the engine's exact-scan path ignores tombstones. Until the
+# extension deletes them itself, search must not return them — a deleted memory that is still
+# recalled is a privacy defect, not a ranking one.
+SEARCH_OVERFETCH = 3
+SEARCH_FETCH_MAX = 600
+
+
+def drop_deleted_documents(rows: list[dict], live_documents: set[int], limit: int) -> list[dict]:
+    """Keep a hit when it names no document (a statement-only chunk) or its document still
+    exists; cut to *limit*; renumber rank_no so the ranks a caller sees are contiguous."""
+    kept = [r for r in rows if r.get("document_id") is None or r["document_id"] in live_documents][:limit]
+    for rank, r in enumerate(kept, start=1):
+        r["rank_no"] = rank
+    return kept
+
+
 def search_core(
     auth,
     *,
@@ -551,9 +569,12 @@ def search_core(
 
     vector = mem_vector_literal(mem_embed(query, {**user_embed, "embedding_model": embedding_model}))
 
-    rows = db_tx_core(
-        auth.conn,
-        lambda c: db_query(
+    # Ask for more than was wanted: chunks of deleted documents are dropped below, and a
+    # search that loses some must still be able to fill its limit.
+    fetch = min(limit * SEARCH_OVERFETCH, SEARCH_FETCH_MAX)
+
+    def _search(c):  # noqa: ANN001, ANN202
+        found = db_query(
             c,
             """SELECT chunk_id, statement_id, document_id, source_text, distance, similarity,
                     rank_no, subject_name, verb_name
@@ -564,14 +585,23 @@ def search_core(
                         p_namespace       => %s,
                         p_limit           => %s,
                         p_metric          => %s)""",
-            [vector, subject, verb, namespace, limit, metric],
-        ),
-    )
+            [vector, subject, verb, namespace, fetch, metric],
+        )
+        doc_ids = sorted({int(r["document_id"]) for r in found if r["document_id"] is not None})
+        live = (
+            db_query(c, "SELECT document_id FROM maludb_document WHERE document_id = ANY(%s)", [doc_ids])
+            if doc_ids
+            else []
+        )
+        return found, {int(r["document_id"]) for r in live}
+
+    rows, live_documents = db_tx_core(auth.conn, _search)
     for r in rows:
         for k in ("chunk_id", "statement_id", "document_id", "rank_no"):
             r[k] = int(r[k]) if r[k] is not None else None
         for k in ("distance", "similarity"):
             r[k] = float(r[k]) if r[k] is not None else None
+    rows = drop_deleted_documents(rows, live_documents, limit)
 
     return {
         "namespace": namespace,

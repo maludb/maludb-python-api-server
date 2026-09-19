@@ -198,3 +198,42 @@ class TestSkillsFleet:
         assert client.get(f"/v1/skills/resolve?name=nope-{RUN}").status_code == 404
         assert client.get("/v1/skills/resolve").status_code == 400
         assert client.get(f"/v1/skills/resolve?name={self.NAME}&version=1&bundle_hash=x").status_code == 422
+
+
+class TestDeletedMemoryIsNotRecalled:
+    """DELETE /v1/documents/{id} leaves the document's vector chunks in the engine (no tenant role
+    can remove them). Recall must not return them."""
+
+    SUBJECT = f"Forgotten Vendor {RUN}"
+    NS = f"agent:forget-{RUN}"
+
+    def _recall(self, client, limit=5):
+        r = client.post(
+            "/v1/memory/recall",
+            json={"query": "payment terms", "subject": self.SUBJECT, "namespaces": [self.NS], "limit": limit},
+        )
+        assert r.status_code == 200, r.text
+        return [x["source_text"] for x in r.json()["results"]]
+
+    def test_a_deleted_memory_is_gone_from_recall_and_the_rest_still_fill_the_limit(self, client):
+        texts = [f"{self.SUBJECT} fact {i}: net {30 + i} days." for i in range(4)]
+        ids = []
+        for text in texts:
+            r = client.post("/v1/memory/remember", json={"text": text, "subject": self.SUBJECT, "namespace": self.NS})
+            assert r.status_code == 201, r.text
+            ids.append(r.json()["document_id"])
+        assert sorted(self._recall(client)) == sorted(texts)
+
+        for doc_id in ids[:2]:
+            assert client.delete(f"/v1/documents/{doc_id}").status_code == 200
+
+        assert sorted(self._recall(client)) == sorted(texts[2:])
+        # limit=2 with two deleted hits ranked anywhere: the over-fetch must still return two.
+        assert sorted(self._recall(client, limit=2)) == sorted(texts[2:])
+
+        search = client.post(
+            "/v1/memory/search", json={"query": "payment terms", "subject": self.SUBJECT, "namespace": self.NS}
+        )
+        assert search.status_code == 200, search.text
+        assert sorted(x["source_text"] for x in search.json()["results"]) == sorted(texts[2:])
+        assert [x["rank_no"] for x in search.json()["results"]] == [1, 2]
