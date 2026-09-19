@@ -114,6 +114,13 @@ async def start_session(auth: Auth, request: Request):
             ],
         ),
     )
+    scope = str(body.get("scope") or "").strip()
+    if scope:
+        # 0.106.0: whose transcript this is. A principal-bound request already lands in its home scope.
+        db_tx_core(
+            auth.conn,
+            lambda c: db_one(c, "SELECT maludb_set_scope('chat_session', %s, %s) AS ok", [int(row["id"]), scope]),
+        )
     return JSONResponse(status_code=201, content={"session": _session_row(auth, int(row["id"]))})
 
 

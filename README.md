@@ -219,6 +219,42 @@ ignores tombstones. So `/v1/memory/search`, `/v1/memory/recall` and the MCP `sea
 and renumbering `rank_no`). A deleted memory is never returned; its text is physically removed
 only once the extension deletes chunks with their document.
 
+### Principals and scopes (API 0.3.0 — maludb_core 0.106.0)
+
+From 0.106.0 the engine enforces, inside a tenant, **who is asking**. A host that holds the tenant
+token names the principal per request; the engine — not this server — decides what it may read and
+write (see `docs/principal-scoping.md` in maludb-core).
+
+| Header | Meaning |
+|---|---|
+| `X-MaluDB-Principal: agent:44` | bind this request to a principal. Absent = unrestricted, as before |
+| `X-MaluDB-Scopes: agent:44, dept:3` | narrow (never widen) that principal's stored grants — comma list or JSON array |
+| `X-MaluDB-Readonly: true` | refuse every scoped write |
+
+The headers can only restrict what the token may do, and a request that names a principal against a
+tenant whose engine would not enforce it is **refused (501)** rather than served unscoped. Refusals
+by the engine arrive as **403** (`insufficient_privilege`); a row outside the principal's scopes is a
+plain 404.
+
+| Route | |
+|---|---|
+| `GET /v1/whoami` | what this request is allowed: principal, read/write scopes, sensitivity ceiling |
+| `GET /v1/principals`, `PUT /v1/principals/{ref}` | register / update a principal (`kind`, `home_scope`, `max_sensitivity`, `enabled`) |
+| `GET/PUT/DELETE /v1/principals/{ref}/scopes[/{scope}]` | scope grants (`read` / `write`) |
+| `PUT /v1/scope` | move a document, memory, episode, chat session or pool into a scope |
+| `DELETE /v1/documents/{id}` | now **forgets**: the document, its vector chunks, the edges carrying its words and its source. Before 0.106.0 the chunks stayed and a deleted memory remained recallable |
+| `DELETE /v1/memory/chunks/{id}` | forget one chunk |
+| `POST /v1/skills/ingest` | accepts `enabled` and `review_state: "proposed"` (+ `proposed_by`) — a proposal never resolves until approved |
+| `POST /v1/skills/{id}/review` | `approved` / `rejected` / `proposed`; an author cannot review their own |
+| `PUT/DELETE /v1/skills/{id}/principals/{ref}` | reserve a skill for named principals |
+| `POST/GET /v1/skills/{id}/loads` | record / list loads (hash, principal, run) |
+| `GET/POST/DELETE /v1/pools/{id}/presence` | who is in a pool, join + heartbeat + cursor, leave |
+| `POST /v1/chat/sessions` | accepts `scope` |
+| `POST /v1/memory/ingest` | the namespace is now applied (document scope + the events it mints) |
+
+A document takes the scope of the namespace of its first edge, so `POST /v1/memory/remember` with a
+`namespace` makes the document — not only its chunk — private to that scope.
+
 ### Agent skills (maludb_core 0.97.0)
 
 `POST /v1/skills/ingest` registers a Claude Agent Skill bundle (SKILL.md +

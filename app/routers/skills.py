@@ -608,6 +608,30 @@ async def ingest_skill(auth: Auth, request: Request):
     # Materiality: explicit override > deterministic screens > LLM judge.
     materiality: dict = {"verdict": "material", "reasons": ["no_parent"]}
     materially_different = True
+
+    # `enabled` has always been an argument of maludb_skill_register; the route never passed it, so a
+    # host ingesting a proposal had it live until its follow-up PATCH. `review_state: "proposed"`
+    # (maludb_core 0.106.0) keeps it out of every resolve until someone approves it.
+    enabled = body.get("enabled")
+    if enabled is not None and not isinstance(enabled, bool):
+        json_error("invalid_field", "enabled must be true or false.", 422)
+    enabled = True if enabled is None else enabled
+    review_state = body.get("review_state")
+    if review_state not in (None, "approved", "proposed"):
+        json_error("invalid_field", "review_state must be approved or proposed.", 422)
+    proposed_by = str(body.get("proposed_by") or "").strip() or None
+    if review_state == "proposed":
+        has_review = db_one(
+            auth.conn,
+            "SELECT to_regprocedure(quote_ident(current_schema())"
+            " || '.maludb_skill_review(bigint,text,text,text)') IS NOT NULL AS ok",
+        )
+        if not has_review or not has_review["ok"]:
+            json_error(
+                "ingest_unavailable",
+                "review_state needs maludb_core 0.106.0 (re-run enable_memory_schema('<tenant>') after upgrading).",
+                501,
+            )
     if parent_id is not None:
         parent_row = db_one(
             auth.conn,
@@ -799,7 +823,8 @@ async def ingest_skill(auth: Auth, request: Request):
                         p_description => %s, p_frontmatter => %s::jsonb, p_version => %s,
                         p_keywords => %s, p_subjects => %s::jsonb, p_verbs => %s::jsonb,
                         p_files => %s::jsonb, p_parent_owner_schema => %s,
-                        p_parent_skill_id => %s, p_materially_different => %s) AS result""",
+                        p_parent_skill_id => %s, p_materially_different => %s,
+                        p_enabled => %s) AS result""",
             [
                 name,
                 markdown,
@@ -814,11 +839,21 @@ async def ingest_skill(auth: Auth, request: Request):
                 parent_schema,
                 parent_id,
                 materially_different,
+                enabled,
             ],
         )
         register = reg_row["result"]
         if isinstance(register, str):
             register = json.loads(register)
+        if review_state == "proposed" and register.get("skill_id") is not None:
+            # 0.106.0: review is apart from `enabled`. Same transaction as the register, so the skill
+            # never exists unreviewed -- the window a host used to close with a PATCH after the fact.
+            review = db_one(
+                conn,
+                "SELECT maludb_skill_review(%s, 'proposed', %s) AS r",
+                [int(register["skill_id"]), proposed_by],
+            )
+            register["review"] = review["r"] if not isinstance(review["r"], str) else json.loads(review["r"])
         return {"ingest": report, "register": register}
 
     result = db_tx_core(auth.conn, _ingest)

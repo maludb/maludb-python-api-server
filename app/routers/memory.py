@@ -661,7 +661,19 @@ async def memory_ingest(auth: Auth, request: Request):
     return JSONResponse(status_code=201, content=payload)
 
 
-def ingest_namespace_report(requested: str) -> dict:
+def ingest_takes_namespace(conn) -> bool:
+    """True when the tenant's maludb_memory_ingest_extraction has p_namespace (maludb_core 0.106.0)."""
+    row = db_one(
+        conn,
+        """SELECT EXISTS(SELECT 1 FROM pg_proc p
+                          WHERE p.proname = 'maludb_memory_ingest_extraction'
+                            AND p.pronamespace = current_schema()::regnamespace
+                            AND 'p_namespace' = ANY (p.proargnames)) AS ok""",
+    )
+    return bool(row and row["ok"])
+
+
+def ingest_namespace_report(requested: str, applied: bool = False) -> dict:
     """What /v1/memory/ingest may truthfully say about the namespace it was given.
 
     maludb_memory_ingest_extraction(jsonb, text, bigint, text) takes no namespace, so every edge this
@@ -671,8 +683,8 @@ def ingest_namespace_report(requested: str) -> dict:
     extension function grows p_namespace (as maludb_memory_ingest_edge already has, which is why
     /v1/memory/documents is unaffected), say what happened instead.
     """
-    if requested == "default":
-        return {"namespace": "default"}
+    if requested == "default" or applied:
+        return {"namespace": requested}
     return {
         "namespace": "default",
         "namespace_requested": requested,
@@ -824,6 +836,10 @@ def ingest_core(
     if extraction is None:
         json_error("upstream_error", "LLM output was not a JSON object.", 502)
 
+    # 0.106.0 engines carry the namespace (it becomes the document's scope, and the scope of the
+    # events the extraction mints); older ones store into 'default' and the report says so.
+    takes_namespace = ingest_takes_namespace(auth.conn)
+
     # Upload text + ingest extraction (one transaction)
     def _ingest(conn):
         doc = db_one(
@@ -832,13 +848,22 @@ def ingest_core(
             [(title or text[:80]).strip(), text, source_type],
         )
         document_id = int(doc["id"])
-        row = db_one(
-            conn,
-            """SELECT maludb_memory_ingest_extraction(
-                        p_extraction => %s::jsonb, p_source_kind => 'document',
-                        p_source_id => %s, p_provenance => 'suggested') AS result""",
-            [json.dumps(extraction), document_id],
-        )
+        if takes_namespace:
+            row = db_one(
+                conn,
+                """SELECT maludb_memory_ingest_extraction(
+                            p_extraction => %s::jsonb, p_source_kind => 'document',
+                            p_source_id => %s, p_provenance => 'suggested', p_namespace => %s) AS result""",
+                [json.dumps(extraction), document_id, namespace],
+            )
+        else:
+            row = db_one(
+                conn,
+                """SELECT maludb_memory_ingest_extraction(
+                            p_extraction => %s::jsonb, p_source_kind => 'document',
+                            p_source_id => %s, p_provenance => 'suggested') AS result""",
+                [json.dumps(extraction), document_id],
+            )
         if row and row["result"] and isinstance(row["result"], str):
             result_val = json.loads(row["result"])
         else:
@@ -851,7 +876,7 @@ def ingest_core(
         "document_id": result["document_id"],
         "model": model,
         "api_format": pr.get("api_format", "openai"),
-        **ingest_namespace_report(namespace),
+        **ingest_namespace_report(namespace, applied=takes_namespace),
         "result": result["result"],
     }
 

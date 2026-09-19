@@ -354,6 +354,21 @@ def delete_document(document_id: int, auth: Auth):
     if row is None:
         json_error("not_found", "Document not found.", 404)
 
+    # maludb_core 0.106.0: one call removes the document, its vector chunks, the edges that carry its
+    # words and its source package. Before it, this route left the chunks behind (document_id on a
+    # chunk is a soft reference) and a deleted memory stayed recallable; the fallback below is that
+    # old behaviour, kept only so the route still works against an engine that has not been upgraded.
+    can_forget = db_one(
+        auth.conn,
+        "SELECT to_regprocedure(quote_ident(current_schema()) || '.maludb_forget_document(bigint)') IS NOT NULL AS ok",
+    )
+    if can_forget and can_forget["ok"]:
+        forgotten = db_tx_core(
+            auth.conn, lambda conn: db_one(conn, "SELECT maludb_forget_document(%s) AS r", [document_id])
+        )
+        report = forgotten["r"] if not isinstance(forgotten["r"], str) else json.loads(forgotten["r"])
+        return {"deleted": True, "id": document_id, "forgotten": report}
+
     # Remove the document's graph edges first — deleting the document cascades
     # its soft tags but NOT its document→subject svpor_statement edges (0.87.0),
     # which would otherwise dangle.
