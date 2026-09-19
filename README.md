@@ -189,6 +189,28 @@ All configuration is via environment variables:
 - **PostgreSQL** for all tenant data via maludb_core facade views
 - **FastAPI dependency injection** for per-request auth + DB connections
 
+### Agent fleets (API 0.2.0 — no extension change)
+
+For a host that runs many AI agents against one tenant. All four routers sit on facades the tenant
+schema already has.
+
+| Route | What it is for |
+|---|---|
+| `POST /v1/memory/remember` | Store text so it can be found again with **no LLM call**: `{text, subject \| subjects[], verb?, namespace?}`. The text itself is the embedded span. |
+| `POST /v1/memory/recall` | Search **several namespaces** at once: `{query, namespaces[], subject?, verb?, limit?}`. With no subject or verb it proposes subjects from the query by name similarity and reports `subjects_tried`. |
+| `/v1/chat/sessions…`, `GET /v1/chat/search` | Ordered transcripts: start, append (one or a batch, atomically), read, finalize, search. `principal` and `external_ref` find "this agent's sessions" and "the session for run 42". |
+| `/v1/principals/{ref}/profile…` | A principal's small standing memory. Updates **supersede**, deletes leave a tombstone, `/history` shows every version. |
+| `GET /v1/skills/resolve`, `/v1/skills/{id}/files[/{path}]` | Resolve a skill name pinned to a `bundle_hash` or `version`; list a bundle's files; fetch one. |
+
+**Namespaces, principal refs and external refs are labels, not access control.** A tenant token reads
+everything in its tenant; the host decides which namespaces a caller may name. Enforcement inside a
+tenant needs principal scoping in the extension (planned for maludb_core 0.106.0), and a truly
+compartment-free recall needs an extension function: `maludb_memory_search()` requires a subject or a
+verb and a tenant role cannot enumerate its vector compartments.
+
+End-to-end tests: `MALUDB_AUTH_STORE=… MALUDB_E2E_TOKEN=malu_… pytest tests/test_agent_fleet_e2e.py`
+against a **scratch** tenant — they write and, memory being append-only, do not clean up.
+
 ### Agent skills (maludb_core 0.97.0)
 
 `POST /v1/skills/ingest` registers a Claude Agent Skill bundle (SKILL.md +
