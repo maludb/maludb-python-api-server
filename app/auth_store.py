@@ -45,13 +45,19 @@ class AuthStore:
     # ------------------------------------------------------------------
 
     def resolve_token(self, token_hash: str) -> dict | None:
-        """Look up a user row by sha256 token hash; returns None if unknown or expired."""
+        """Look up a user row by sha256 token hash; returns None if unknown or expired.
+
+        Both sides go through SQLite's datetime(): tokens.py stores "YYYY-MM-DD HH:MM:SS" and a
+        plain string comparison against an ISO "…T…Z" now sorts the space below the "T", which
+        expired every token at 00:00 UTC of its last day — and would kill a short-lived token
+        (minutes, not days) the moment it was minted. datetime() reads either spelling.
+        """
         cursor = self._conn.execute(
             """
             SELECT user_id, role, pg_dbname, pg_user, pg_password
               FROM users
              WHERE token_hash = ?
-               AND (expires_at IS NULL OR expires_at > strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+               AND (expires_at IS NULL OR datetime(expires_at) > datetime('now'))
              LIMIT 1
             """,
             (token_hash,),
