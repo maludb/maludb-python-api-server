@@ -339,6 +339,13 @@ async def update_document(document_id: int, auth: Auth, request: Request):
 
 @router.delete("/v1/documents/{document_id}")
 def delete_document(document_id: int, auth: Auth):
+    """Delete the document, its source package and its graph edges.
+
+    NOT deleted: the document's vector chunks. They live in a core table that no tenant role can
+    reach and no facade removes (maludb_core <= 0.105.x). Memory search hides them — see
+    drop_deleted_documents() in routers/memory.py — so a deleted document is never recalled, but
+    its text stays on disk until the extension removes chunks with their document.
+    """
     row = db_one(
         auth.conn,
         "SELECT source_package_id FROM maludb_document WHERE document_id = %s",

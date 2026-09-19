@@ -160,3 +160,36 @@ class TestPrincipalNames:
 
         with pytest.raises(APIError):
             check_key(key)
+
+
+class TestDeletedDocumentsAreNotRecalled:
+    """A deleted document's vector chunks outlive it in the engine; search must not return them."""
+
+    @staticmethod
+    def _hit(chunk_id, document_id, rank):
+        return {"chunk_id": chunk_id, "document_id": document_id, "rank_no": rank, "source_text": f"c{chunk_id}"}
+
+    def test_a_hit_whose_document_is_gone_is_dropped_and_ranks_stay_contiguous(self):
+        from app.routers.memory import drop_deleted_documents
+
+        rows = [self._hit(1, 10, 1), self._hit(2, 11, 2), self._hit(3, 12, 3)]
+        kept = drop_deleted_documents(rows, live_documents={10, 12}, limit=5)
+        assert [(r["chunk_id"], r["rank_no"]) for r in kept] == [(1, 1), (3, 2)]
+
+    def test_a_statement_only_chunk_names_no_document_and_is_kept(self):
+        from app.routers.memory import drop_deleted_documents
+
+        kept = drop_deleted_documents([self._hit(1, None, 1)], live_documents=set(), limit=5)
+        assert [r["chunk_id"] for r in kept] == [1]
+
+    def test_the_over_fetch_refills_the_limit(self):
+        from app.routers.memory import drop_deleted_documents
+
+        rows = [self._hit(i, 100 + i, i) for i in range(1, 7)]
+        kept = drop_deleted_documents(rows, live_documents={103, 104, 105, 106}, limit=2)
+        assert [r["chunk_id"] for r in kept] == [3, 4]
+
+    def test_nothing_live_means_nothing_returned(self):
+        from app.routers.memory import drop_deleted_documents
+
+        assert drop_deleted_documents([self._hit(1, 10, 1)], live_documents=set(), limit=5) == []
