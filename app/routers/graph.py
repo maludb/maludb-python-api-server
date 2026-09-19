@@ -727,18 +727,18 @@ async def graph_import(auth: Auth, request: Request):
 
     # ---- normalize links -------------------------------------------------
     edges: list[dict] = []
-    for i, l in enumerate(links):
-        if not isinstance(l, dict):
+    for i, link in enumerate(links):
+        if not isinstance(link, dict):
             skipped.append({"section": "links", "index": i, "reason": "not an object"})
             continue
-        src = _clean_text(l.get("source") or "", 512)
-        tgt = _clean_text(l.get("target") or "", 512)
+        src = _clean_text(link.get("source") or "", 512)
+        tgt = _clean_text(link.get("target") or "", 512)
         if src not in subjects_by_id or tgt not in subjects_by_id:
             skipped.append({"section": "links", "index": i, "reason": "unknown source/target node id"})
             continue
-        relation = _clean_text(l.get("relation") or "related_to", 120) or "related_to"
+        relation = _clean_text(link.get("relation") or "related_to", 120) or "related_to"
         edge = {"subject": src, "verb": relation, "object": tgt}
-        confidence = _link_confidence(l.get("confidence"))
+        confidence = _link_confidence(link.get("confidence"))
         if confidence is not None:
             edge["confidence"] = confidence
         edges.append(edge)
