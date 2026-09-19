@@ -25,6 +25,7 @@ from app import config
 from app.auth_store import AuthStore
 from app.database import TenantConnection
 from app.errors import json_error
+from app.principal import apply_principal
 from app.sql_log import get_tracer
 
 # ---------------------------------------------------------------------------
@@ -117,6 +118,8 @@ async def require_auth(request: Request):  # noqa: ANN201 — generator dependen
     """FastAPI dependency: authenticate, yield the context, close the connection."""
     ctx = authenticate_bearer(request.headers.get("authorization"))
     try:
+        # 0.106.0: bind the connection to the principal the host names, if any (app/principal.py).
+        apply_principal(ctx.conn, request.headers)
         yield ctx
     finally:
         try:

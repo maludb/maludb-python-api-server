@@ -43,6 +43,7 @@ from app.routers import (
     principals,
     projects,
     rest,
+    scoping,
     skills,
     skills_fleet,
     statements,
@@ -64,6 +65,7 @@ app = FastAPI(title="MaluDB API")
 # ---------------------------------------------------------------------------
 
 app.include_router(agent_memory.router)
+app.include_router(scoping.router)  # before skills/pools: /v1/skills/{id}/review etc. are its own
 app.include_router(attributes.router)
 app.include_router(chat.router)
 app.include_router(documents.router)
