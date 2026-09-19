@@ -288,3 +288,50 @@ class TestDeleteTokenSuccess:
             )
         assert resp.status_code == 403
         assert resp.json()["error"]["code"] == "forbidden"
+
+
+# ---------------------------------------------------------------------------
+# Expiry — resolve_token() compares instants, not strings
+# ---------------------------------------------------------------------------
+
+
+class TestTokenExpiry:
+    """tokens.py stores "YYYY-MM-DD HH:MM:SS"; resolve_token() used to compare that string with an
+    ISO "…T…Z" now. On the token's last day the space sorted below the "T" and the token was
+    already dead — fatal for a token that lives minutes rather than days."""
+
+    @staticmethod
+    def _insert(store, token_hash: str, expires_at: str | None) -> None:
+        store.connection.execute(
+            """
+            INSERT INTO users (token_hash, token_prefix, user_id, role, pg_dbname, pg_user, pg_password, expires_at)
+            VALUES (?, 'testpfx1', 1, 'user', 'db', 'u', 'p', ?)
+            """,
+            (token_hash, expires_at),
+        )
+        store.connection.commit()
+
+    def test_token_expiring_later_today_still_resolves(self, _mock_auth_store):
+        from datetime import UTC, datetime, timedelta
+
+        soon = (datetime.now(UTC) + timedelta(minutes=10)).strftime("%Y-%m-%d %H:%M:%S")
+        self._insert(_mock_auth_store, "hash-soon", soon)
+        assert _mock_auth_store.resolve_token("hash-soon") is not None
+
+    def test_expired_token_does_not_resolve(self, _mock_auth_store):
+        from datetime import UTC, datetime, timedelta
+
+        past = (datetime.now(UTC) - timedelta(minutes=1)).strftime("%Y-%m-%d %H:%M:%S")
+        self._insert(_mock_auth_store, "hash-past", past)
+        assert _mock_auth_store.resolve_token("hash-past") is None
+
+    def test_iso_spelling_is_read_too(self, _mock_auth_store):
+        from datetime import UTC, datetime, timedelta
+
+        soon = (datetime.now(UTC) + timedelta(minutes=10)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        self._insert(_mock_auth_store, "hash-iso", soon)
+        assert _mock_auth_store.resolve_token("hash-iso") is not None
+
+    def test_no_expiry_resolves(self, _mock_auth_store):
+        self._insert(_mock_auth_store, "hash-never", None)
+        assert _mock_auth_store.resolve_token("hash-never") is not None

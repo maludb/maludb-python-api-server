@@ -64,3 +64,21 @@ class TestMemoryNotFound:
     def test_nonexistent_memory_route(self):
         r = client.get("/v1/memory/nonexistent")
         assert r.status_code in (404, 405)
+
+
+class TestIngestNamespaceReport:
+    """/v1/memory/ingest cannot store into a namespace; it must not claim it did."""
+
+    def test_default_namespace_is_reported_plainly(self):
+        from app.routers.memory import ingest_namespace_report
+
+        assert ingest_namespace_report("default") == {"namespace": "default"}
+
+    def test_a_requested_namespace_is_reported_as_not_applied(self):
+        from app.routers.memory import ingest_namespace_report
+
+        report = ingest_namespace_report("agent:42")
+        assert report["namespace"] == "default"
+        assert report["namespace_requested"] == "agent:42"
+        assert report["namespace_applied"] is False
+        assert "agent:42" in report["warnings"][0]

@@ -25,7 +25,9 @@ from app.errors import (
     unhandled_error_handler,
 )
 from app.routers import (
+    agent_memory,
     attributes,
+    chat,
     documents,
     episodes,
     graph,
@@ -38,9 +40,11 @@ from app.routers import (
     notes,
     objects,
     pools,
+    principals,
     projects,
     rest,
     skills,
+    skills_fleet,
     statements,
     subjects,
     tokens,
@@ -59,7 +63,9 @@ app = FastAPI(title="MaluDB API")
 # Routers
 # ---------------------------------------------------------------------------
 
+app.include_router(agent_memory.router)
 app.include_router(attributes.router)
+app.include_router(chat.router)
 app.include_router(documents.router)
 app.include_router(episodes.router)
 app.include_router(graph.router)
@@ -72,9 +78,11 @@ app.include_router(model_prompts.router)
 app.include_router(notes.router)
 app.include_router(objects.router)
 app.include_router(pools.router)
+app.include_router(principals.router)
 app.include_router(projects.router)
 app.include_router(rest.router_rest)
 app.include_router(rest.router_tables)
+app.include_router(skills_fleet.router)  # before skills: /v1/skills/resolve must not match /v1/skills/{id}
 app.include_router(skills.router)
 app.include_router(statements.router)
 app.include_router(subjects.router)

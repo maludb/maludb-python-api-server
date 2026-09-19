@@ -631,6 +631,29 @@ async def memory_ingest(auth: Auth, request: Request):
     return JSONResponse(status_code=201, content=payload)
 
 
+def ingest_namespace_report(requested: str) -> dict:
+    """What /v1/memory/ingest may truthfully say about the namespace it was given.
+
+    maludb_memory_ingest_extraction(jsonb, text, bigint, text) takes no namespace, so every edge this
+    route writes lands in 'default' whatever the caller asked for. The route used to echo the
+    requested value back, which reads as "stored there" — and a caller scoping memory by namespace
+    (one per agent or department) would believe a write was private when it was not. Until the
+    extension function grows p_namespace (as maludb_memory_ingest_edge already has, which is why
+    /v1/memory/documents is unaffected), say what happened instead.
+    """
+    if requested == "default":
+        return {"namespace": "default"}
+    return {
+        "namespace": "default",
+        "namespace_requested": requested,
+        "namespace_applied": False,
+        "warnings": [
+            f"namespace '{requested}' was not applied: /v1/memory/ingest stores into 'default'. "
+            "Use /v1/memory/documents for namespaced writes."
+        ],
+    }
+
+
 def ingest_core(
     auth,
     *,
@@ -798,7 +821,7 @@ def ingest_core(
         "document_id": result["document_id"],
         "model": model,
         "api_format": pr.get("api_format", "openai"),
-        "namespace": namespace,
+        **ingest_namespace_report(namespace),
         "result": result["result"],
     }
 

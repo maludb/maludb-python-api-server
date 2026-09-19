@@ -1,0 +1,21 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[dev]"
+      # The unit suite needs no Postgres: routes are checked for registration and the pure helpers
+      # are tested directly. The end-to-end suites (test_rest_e2e, test_agent_fleet_e2e) skip
+      # themselves unless MALUDB_E2E_TOKEN is set — run those against a scratch tenant.
+      - run: pytest -q
+      - run: ruff check app/ tests/
