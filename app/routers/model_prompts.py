@@ -19,6 +19,7 @@ from fastapi import APIRouter, Request
 from app.auth import get_auth_store
 from app.database import test_credentials
 from app.errors import json_error
+from app.store_crypto import seal
 
 router = APIRouter()
 
@@ -86,7 +87,7 @@ async def upsert_model_prompt(request: Request):
                 max_tokens, generation_params, updated_at)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))""",
         (model_name, model_identifier, api_format, system_prompt, base_url,
-         effective_api_key, max_tokens, generation_params),
+         seal(effective_api_key), max_tokens, generation_params),
     )
     conn.commit()
 

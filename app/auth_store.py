@@ -10,6 +10,8 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
+from app.store_crypto import seal, unseal
+
 # Schema file path (relative to project root)
 _SCHEMA_FILE = Path(__file__).resolve().parent.parent / "config" / "auth_store.sql"
 
@@ -63,7 +65,11 @@ class AuthStore:
             (token_hash,),
         )
         row = cursor.fetchone()
-        return dict(row) if row is not None else None
+        if row is None:
+            return None
+        user = dict(row)
+        user["pg_password"] = unseal(user["pg_password"])
+        return user
 
     # ------------------------------------------------------------------
     # Next user ID (for token-create when no user_id is supplied)
@@ -92,7 +98,11 @@ class AuthStore:
             (model_name,),
         )
         row = cursor.fetchone()
-        return dict(row) if row is not None else None
+        if row is None:
+            return None
+        prompt = dict(row)
+        prompt["api_key"] = unseal(prompt["api_key"])
+        return prompt
 
     # ------------------------------------------------------------------
     # Default-prompt catalog (seeded by app/llm_catalog.py)
@@ -147,7 +157,11 @@ class AuthStore:
             (user_id, provider),
         )
         row = cursor.fetchone()
-        return dict(row) if row is not None else None
+        if row is None:
+            return None
+        key = dict(row)
+        key["api_key"] = unseal(key["api_key"])
+        return key
 
     def list_user_provider_keys(self, user_id: int) -> list[dict]:
         """The user's providers — key value never selected, only key_set."""
@@ -184,7 +198,7 @@ class AuthStore:
                 base_url   = excluded.base_url,
                 updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
             """,
-            (user_id, provider, api_key, base_url),
+            (user_id, provider, seal(api_key), base_url),  # sealed at rest when MALUDB_STORE_KEY is set
         )
         self._conn.commit()
 

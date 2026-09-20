@@ -21,6 +21,8 @@ from app.errors import (
     APIError,
     api_error_handler,
     database_error_handler,
+    secret_format_error_handler,
+    store_key_error_handler,
     tenant_db_error_handler,
     unhandled_error_handler,
 )
@@ -53,6 +55,7 @@ from app.routers import (
     verbs,
 )
 from app.sql_log import SqlTracer, set_tracer
+from app.store_crypto import SecretFormatError, StoreKeyError
 
 # ---------------------------------------------------------------------------
 # Create the FastAPI app
@@ -99,6 +102,8 @@ app.include_router(types.router)
 app.add_exception_handler(APIError, api_error_handler)  # type: ignore[arg-type]
 app.add_exception_handler(psycopg.errors.DatabaseError, database_error_handler)  # type: ignore[arg-type]
 app.add_exception_handler(TenantDatabaseError, tenant_db_error_handler)  # type: ignore[arg-type]
+app.add_exception_handler(StoreKeyError, store_key_error_handler)  # type: ignore[arg-type]
+app.add_exception_handler(SecretFormatError, secret_format_error_handler)  # type: ignore[arg-type]
 # Last-resort catch-all so unexpected Python exceptions still return the
 # standard JSON error shape instead of Starlette's bare HTML 500.
 app.add_exception_handler(Exception, unhandled_error_handler)  # type: ignore[arg-type]
