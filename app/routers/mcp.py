@@ -49,7 +49,7 @@ router = APIRouter()
 # Protocol constants
 # ---------------------------------------------------------------------------
 
-SERVER_VERSION = "0.3.0"
+SERVER_VERSION = "0.3.1"
 PROTOCOL_VERSIONS = {"2025-03-26", "2025-06-18"}
 DEFAULT_PROTOCOL_VERSION = "2025-06-18"
 SERVER_INFO = {"name": "maludb", "title": "MaluDB Memory", "version": SERVER_VERSION}

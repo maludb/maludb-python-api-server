@@ -21,6 +21,7 @@ from fastapi.responses import JSONResponse
 from app.auth import get_auth_store
 from app.database import test_credentials
 from app.errors import json_error
+from app.store_crypto import seal
 
 router = APIRouter()
 
@@ -102,7 +103,7 @@ async def create_token(request: Request) -> JSONResponse:
              pg_dbname, pg_user, pg_password, expires_at, device_name)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (token_hash, prefix, user_id, role, db, user, password, expires_at, device_name),
+        (token_hash, prefix, user_id, role, db, user, seal(password), expires_at, device_name),
     )
     conn.commit()
     row_id = cursor.lastrowid

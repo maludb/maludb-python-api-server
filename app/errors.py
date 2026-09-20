@@ -185,6 +185,24 @@ async def unhandled_error_handler(_request: Request, exc: Exception) -> JSONResp
     )
 
 
+async def store_key_error_handler(_request: Request, exc: Exception) -> JSONResponse:
+    """StoreKeyError → 503. The auth store holds sealed secrets this process cannot open
+    (MALUDB_STORE_KEY missing or wrong). An operator problem, not the caller's: say so plainly —
+    the message names the setting and never a secret."""
+    return JSONResponse(
+        status_code=503,
+        content={"error": {"code": "store_key_unavailable", "message": str(exc)}},
+    )
+
+
+async def secret_format_error_handler(_request: Request, exc: Exception) -> JSONResponse:
+    """SecretFormatError → 422: the secret as given cannot be stored."""
+    return JSONResponse(
+        status_code=422,
+        content={"error": {"code": "validation_failed", "message": str(exc)}},
+    )
+
+
 async def tenant_db_error_handler(_request: Request, exc: Exception) -> JSONResponse:
     """
     Handle TenantDatabaseError → 502 (auth failure) or 503 (unavailable).

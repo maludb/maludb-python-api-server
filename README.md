@@ -180,6 +180,37 @@ All configuration is via environment variables:
 | `MALUDB_AUTH_STORE` | `data/auth.db` | SQLite auth database path |
 | `MALUDB_DEBUG` | (unset) | Set to `1` to enable `?debug=1` |
 | `MALUDB_LOG_DIR` | `/var/log/maludb` | Log directory |
+| `MALUDB_STORE_KEY` | (unset) | Seals the secrets in the auth store at rest — see below. Unset = stored plain, as before |
+
+### Secrets at rest (API 0.3.1)
+
+The auth store keeps three secrets in ordinary columns: each tenant's **Postgres password**
+(`users.pg_password`), users' **provider API keys** (`user_provider_keys.api_key`) and a model
+prompt's own key (`model_prompts.api_key`). With `MALUDB_STORE_KEY` set they are stored as
+`enc:v1:<Fernet token>`; the API seals on write and opens on read, so nothing else changes.
+
+**What it protects:** the file. A backup, a copied disk or a stray `scp` of `auth.db` no longer
+yields every tenant's database password. **What it does not:** someone who controls the running
+service or can read its environment — the key lives beside the process. Keep the key out of the
+store's backups, or the backup carries both halves.
+
+```bash
+python -m app.seal_store --new-key     # print a key; put it in config/maludb.env as MALUDB_STORE_KEY=…
+sudo systemctl restart maludb-api      # new writes are sealed from here on
+python -m app.seal_store --check       # how many secrets are sealed / still plain
+python -m app.seal_store               # seal the existing ones — one transaction, idempotent
+```
+
+Turning it on cannot lock anyone out: a store with plain rows keeps working under a key (plain
+rows still read), and the seal command opens every value it wrote before it commits. The other
+direction is deliberate: a sealed row **without** its key is an error — every request answers
+`503 store_key_unavailable` naming the setting — never a silent fallback.
+
+**Rotation:** `MALUDB_STORE_KEY=<new>,<old>` (the first seals, all open) → restart →
+`python -m app.seal_store --reseal` → remove `<old>` → restart.
+
+**Losing the key loses the secrets**: every token must be minted again and every provider key
+re-entered. Store a copy of the key somewhere the auth store's backups are not.
 
 ## Architecture
 
