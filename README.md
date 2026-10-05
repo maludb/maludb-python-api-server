@@ -229,6 +229,7 @@ schema already has.
 |---|---|
 | `POST /v1/memory/remember` | Store text so it can be found again with **no LLM call**: `{text, subject \| subjects[], verb?, namespace?}`. The text itself is the embedded span. |
 | `POST /v1/memory/recall` | Search **several namespaces** at once: `{query, namespaces[], subject?, verb?, limit?}`. With no subject or verb it proposes subjects from the query by name similarity and reports `subjects_tried`. |
+| `POST /v1/memory/answer` | Retrieve from a namespace and compose a **cited, verified** answer (0.4.0): every quote is checked against the evidence it cites, an unverifiable answer is withheld, no evidence calls no model. See [docs/memory-answer.md](docs/memory-answer.md). |
 | `/v1/chat/sessions…`, `GET /v1/chat/search` | Ordered transcripts: start, append (one or a batch, atomically), read, finalize, search. `principal` and `external_ref` find "this agent's sessions" and "the session for run 42". |
 | `/v1/principals/{ref}/profile…` | A principal's small standing memory. Updates **supersede**, deletes leave a tombstone, `/history` shows every version. |
 | `GET /v1/skills/resolve`, `/v1/skills/{id}/files[/{path}]` | Resolve a skill name pinned to a `bundle_hash` or `version`; list a bundle's files; fetch one. |

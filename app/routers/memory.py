@@ -542,6 +542,20 @@ def drop_deleted_documents(rows: list[dict], live_documents: set[int], limit: in
     return kept
 
 
+def resolve_query_vector(auth, query: str, namespace: str, embedding_model: str | None) -> tuple[str, str]:
+    """(embedding model name, the query's vector literal).  Same embedding model (and precedence) as document
+    ingest: caller > namespace config > the user's 'embed' choice > env default."""
+    cfg_raw = _namespace_config(auth.conn, namespace)
+    user_embed = resolve_embed_config(get_auth_store(), auth.user_id)
+    embedding_model = (
+        embedding_model
+        or cfg_raw.get("embedding_model")
+        or user_embed.get("embedding_model")
+        or os.environ.get("MALUDB_EMBED_MODEL", "maludb-local-dev")
+    )
+    return embedding_model, mem_vector_literal(mem_embed(query, {**user_embed, "embedding_model": embedding_model}))
+
+
 def search_core(
     auth,
     *,
@@ -552,22 +566,13 @@ def search_core(
     limit: int,
     metric: str,
     embedding_model: str | None,
+    vector: str | None = None,
 ) -> dict:
     """Embed the query and run the vector search, shared by the REST route and
-    the MCP search_memory tool.  Raises APIError on failure."""
-    # Same embedding model (and precedence) as document ingest:
-    # caller > namespace config > the user's 'embed' choice > env default.
-    cfg_raw = _namespace_config(auth.conn, namespace)
-    user_embed = resolve_embed_config(get_auth_store(), auth.user_id)
-
-    embedding_model = (
-        embedding_model
-        or cfg_raw.get("embedding_model")
-        or user_embed.get("embedding_model")
-        or os.environ.get("MALUDB_EMBED_MODEL", "maludb-local-dev")
-    )
-
-    vector = mem_vector_literal(mem_embed(query, {**user_embed, "embedding_model": embedding_model}))
+    the MCP search_memory tool.  Raises APIError on failure.  A caller that searches several
+    compartments for one question embeds it once (resolve_query_vector) and passes `vector`."""
+    if vector is None:
+        embedding_model, vector = resolve_query_vector(auth, query, namespace, embedding_model)
 
     # Ask for more than was wanted: chunks of deleted documents are dropped below, and a
     # search that loses some must still be able to fill its limit.
