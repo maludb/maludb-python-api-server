@@ -1,6 +1,6 @@
 [project]
 name = "maludb-api"
-version = "0.4.0"
+version = "0.4.1"
 description = "MaluDB API server — Python FastAPI edition (maludb_core 0.96.0 and later; tested on 0.105.3)"
 requires-python = ">=3.12"
 dependencies = [

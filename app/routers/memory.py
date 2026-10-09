@@ -38,6 +38,7 @@ from app.helpers.llm import (
     mem_vector_literal,
 )
 from app.helpers.llm_resolve import resolve_embed_config, resolve_task_config
+from app.helpers.subject_types import resolve_subject_types
 
 router = APIRouter()
 
@@ -418,6 +419,11 @@ def documents_core(
         )
         document_id = int(doc["id"])
 
+        # M12: an unseen subject type is registered (or falls back, the declared type kept as an attribute) — the core
+        # refuses a type its catalogue lacks, and a host's vocabulary types (product, policy …) are not in it.
+        declared = [str(e.get("subject_type", "")).strip() or default_subject for e in edges]
+        type_of = resolve_subject_types(conn, declared, default_subject, db_query)
+
         out: list[dict] = []
         for e in edges:
             subject_text = str(e.get("subject_text", "")).strip()
@@ -425,8 +431,12 @@ def documents_core(
             if not subject_text or not verb_text:
                 json_error("validation_failed", "Each edge needs subject_text and verb_text.", 422)
 
-            predicate = json.dumps(e["predicate"]) if isinstance(e.get("predicate"), list) else "[]"
-            subject_ty = str(e.get("subject_type", "")).strip() or default_subject
+            declared_ty = str(e.get("subject_type", "")).strip() or default_subject
+            subject_ty = type_of.get(declared_ty, declared_ty)
+            pred_list = list(e["predicate"]) if isinstance(e.get("predicate"), list) else []
+            if subject_ty != declared_ty and subject_ty != declared_ty.lower():
+                pred_list.append({"attr_name": "declared_subject_type", "value_text": declared_ty})
+            predicate = json.dumps(pred_list)
             confidence = str(e["confidence"]) if "confidence" in e and e["confidence"] is not None else None
             provenance = str(e.get("provenance", "")).strip() or default_prov
             extr_model = model_id if model_id else extractor
