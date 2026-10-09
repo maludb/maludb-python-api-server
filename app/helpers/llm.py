@@ -163,8 +163,21 @@ def llm_complete(cfg: dict, system: str, user: str) -> str:
     return llm_complete_openai(cfg, system, user)
 
 
+def llm_complete_usage(cfg: dict, system: str, user: str) -> tuple[str, dict]:
+    """llm_complete that also answers the provider's usage (M2: a caller can report what a call cost in tokens)."""
+    fmt = str(cfg.get("api_format", "openai")).lower()
+    if fmt == "anthropic":
+        return llm_complete_anthropic_usage(cfg, system, user)
+    return llm_complete_openai_usage(cfg, system, user)
+
+
 def llm_complete_openai(cfg: dict, system: str, user: str) -> str:
     """OpenAI chat/completions with a system + user message."""
+    return llm_complete_openai_usage(cfg, system, user)[0]
+
+
+def llm_complete_openai_usage(cfg: dict, system: str, user: str) -> tuple[str, dict]:
+    """The same call, answering (text, usage) — usage is {input_tokens, output_tokens} as the provider reported them."""
     base = cfg.get("base_url", "")
     token = cfg.get("token")
     model = cfg.get("model_identifier", "")
@@ -205,11 +218,20 @@ def llm_complete_openai(cfg: dict, system: str, user: str) -> str:
         pass
     if not isinstance(content, str):
         json_error("upstream_error", "OpenAI returned no content.", 502)
-    return content
+    u = data.get("usage") if isinstance(data, dict) and isinstance(data.get("usage"), dict) else {}
+    return content, {
+        "input_tokens": int(u.get("prompt_tokens") or 0),
+        "output_tokens": int(u.get("completion_tokens") or 0),
+    }
 
 
 def llm_complete_anthropic(cfg: dict, system: str, user: str) -> str:
     """Anthropic messages API — system is a top-level field."""
+    return llm_complete_anthropic_usage(cfg, system, user)[0]
+
+
+def llm_complete_anthropic_usage(cfg: dict, system: str, user: str) -> tuple[str, dict]:
+    """The same call, answering (text, usage)."""
     base = cfg.get("base_url", "")
     token = cfg.get("token")
     model = cfg.get("model_identifier", "")
@@ -254,7 +276,11 @@ def llm_complete_anthropic(cfg: dict, system: str, user: str) -> str:
             text_out += block["text"]
     if not text_out:
         json_error("upstream_error", "Anthropic returned no text content.", 502)
-    return text_out
+    u = data.get("usage") if isinstance(data.get("usage"), dict) else {}
+    return text_out, {
+        "input_tokens": int(u.get("input_tokens") or 0),
+        "output_tokens": int(u.get("output_tokens") or 0),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -306,10 +332,10 @@ def llm_json_from_text(content: str) -> dict | None:
 
 
 _DEFAULT_PROMPT = (
-    'Extract Subject-Verb-Predicate-Object edges from the text. Use SMALL canonical verbs '
+    "Extract Subject-Verb-Predicate-Object edges from the text. Use SMALL canonical verbs "
     '(e.g. "upgrade", not "performed_upgrade"); put status/timing/role/detail into the '
     "predicate array as edge-attributes (value_text / value_timestamp / value_numeric). "
-    'Prefer subject_type in person|software|project|other. Return ONLY JSON of the form '
+    "Prefer subject_type in person|software|project|other. Return ONLY JSON of the form "
     '{"candidate_edges":[{"subject_text":"","subject_type":"","verb_text":"",'
     '"predicate":[{"attr_name":"","value_text":""}],"source_span":"","confidence":0.0}]}.'
     "\n\nText:\n{{chunk}}"

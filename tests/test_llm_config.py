@@ -98,13 +98,14 @@ class TestCatalog:
         resp = client.get("/v1/llm/catalog", headers=_HEADERS)
         assert resp.status_code == 200
         data = resp.json()
-        assert set(data["tasks"]) == {"embed", "extract", "skill_extract", "query_parse"}
+        assert set(data["tasks"]) == {"embed", "extract", "skill_extract", "query_parse", "answer"}
         by_key = {(m["model_name"], m["task"]): m for m in data["models"]}
         assert ("gpt-4o", "extract") in by_key
         assert ("claude-sonnet", "extract") in by_key
         assert by_key[("gpt-4o", "extract")]["provider"] == "openai"
         assert by_key[("gpt-4o", "extract")]["has_system_prompt"] is True
         assert by_key[("text-embedding-3-small", "embed")]["has_system_prompt"] is False
+        assert by_key[("gpt-4o", "answer")]["has_system_prompt"] is False  # M1 builds the answer prompt itself
 
     def test_catalog_never_returns_prompt_text_or_keys(self, client: TestClient):
         resp = client.get("/v1/llm/catalog", headers=_HEADERS)
